@@ -1,0 +1,47 @@
+[package]
+name = "keepass"
+version = "0.8.12"
+edition = "2018"
+license = "MIT"
+autobins = false
+[package.metadata.vendored]
+repository = "https://github.com/sseemayer/keepass-rs"
+revision = "336ece758106fb6cd5e6d2f9c3db214183f72705"
+patches = ["bounded UTF-8 XML and decompression", "RustCrypto Argon2 0.5.3 backend", "Zeroizing owned secrets and derived keys", "KDBX outer end marker", "constant-time authentication comparisons"]
+[features]
+default = []
+save_kdbx4 = []
+serialization = []
+totp = []
+challenge_response = []
+_merge = []
+utilities = []
+[dependencies]
+thiserror = "2"
+byteorder = "1"
+xml-rs = "0.8.29"
+flate2 = "1"
+base64 = "0.22"
+hex-literal = "1"
+chrono = { version = "0.4.23", default-features = false, features = ["clock", "std"] }
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "zeroize"] }
+sha2 = "0.10"
+aes = { version = "0.8", features = ["zeroize"] }
+hmac = "0.12"
+salsa20 = { version = "0.10", features = ["zeroize"] }
+chacha20 = { version = "0.9", features = ["zeroize"] }
+cipher = { version = "0.4", features = ["std"] }
+twofish = "0.7"
+cbc = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+hex = "0.4"
+getrandom = { version = "0.3", features = ["std"] }
+zeroize = { version = "1", features = ["zeroize_derive"] }
+subtle = "2.6"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tarpaulin_include)"] }
+
+[dependencies.generic-array]
+version = "0.14"
+features = ["zeroize"]
