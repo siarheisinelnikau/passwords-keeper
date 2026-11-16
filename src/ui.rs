@@ -1338,7 +1338,8 @@ impl App {
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let language = self.prefs.language;
         let t = |key: &str| i18n::text(language, key).to_string();
-        let height = (ctx.content_rect().height() - 140.).clamp(180., 560.);
+        // Reserve the styled title bar, window margins, and a fixed close footer.
+        let height = (ctx.content_rect().height() - 240.).clamp(140., 560.);
         let response = egui::Window::new(t("settings"))
             .id(egui::Id::new("settings_window"))
             .open(&mut open)
@@ -1965,6 +1966,7 @@ mod tests {
         );
     }
     fn settings_frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
+        app.apply_style(ctx);
         let _ = ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -1983,58 +1985,62 @@ mod tests {
     }
     #[test]
     fn settings_close_button_and_escape_remain_closed() {
-        let (mut app, _, ctx) = harness();
-        app.settings_open = true;
-        for _ in 0..3 {
-            settings_frame(&mut app, &ctx, vec![]);
-        }
-        let rect = ctx
-            .data(|data| data.get_temp::<egui::Rect>(egui::Id::new("test_settings_close")))
-            .unwrap();
-        assert!(
-            rect.bottom() <= 640.,
-            "close button outside the smallest viewport"
-        );
-        let pos = rect.center();
-        settings_frame(
-            &mut app,
-            &ctx,
-            vec![
-                egui::Event::PointerMoved(pos),
-                egui::Event::PointerButton {
+        for language in Language::ALL {
+            let (mut app, _, ctx) = harness();
+            app.prefs.language = language;
+            app.settings_open = true;
+            for _ in 0..3 {
+                settings_frame(&mut app, &ctx, vec![]);
+            }
+            let rect = ctx
+                .data(|data| data.get_temp::<egui::Rect>(egui::Id::new("test_settings_close")))
+                .unwrap();
+            assert!(
+                rect.bottom() <= 640.,
+                "close button outside the smallest viewport: {rect:?}, window {:?}",
+                ctx.data(|data| data.get_temp::<egui::Rect>(egui::Id::new("test_settings_window")))
+            );
+            let pos = rect.center();
+            settings_frame(
+                &mut app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+            settings_frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerButton {
                     pos,
                     button: egui::PointerButton::Primary,
-                    pressed: true,
+                    pressed: false,
                     modifiers: Default::default(),
-                },
-            ],
-        );
-        settings_frame(
-            &mut app,
-            &ctx,
-            vec![egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed: false,
-                modifiers: Default::default(),
-            }],
-        );
-        assert!(!app.settings_open);
-        settings_frame(&mut app, &ctx, vec![]);
-        assert!(!app.settings_open);
-        app.settings_open = true;
-        settings_frame(
-            &mut app,
-            &ctx,
-            vec![egui::Event::Key {
-                key: egui::Key::Escape,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: Default::default(),
-            }],
-        );
-        assert!(!app.settings_open);
+                }],
+            );
+            assert!(!app.settings_open);
+            settings_frame(&mut app, &ctx, vec![]);
+            assert!(!app.settings_open);
+            app.settings_open = true;
+            settings_frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }],
+            );
+            assert!(!app.settings_open);
+        }
     }
     #[test]
     fn attachment_responses_preserve_unsaved_fields_and_stale_choosers_cannot_cross_lock() {
