@@ -9,10 +9,10 @@ use crate::{
     error::{DatabaseIntegrityError, DatabaseKeyError, DatabaseOpenError},
     format::{
         kdbx4::{
-            KDBX4OuterHeader, HEADER_COMMENT, HEADER_COMPRESSION_ID, HEADER_ENCRYPTION_IV, HEADER_END,
-            HEADER_KDF_PARAMS, HEADER_MASTER_SEED, HEADER_OUTER_ENCRYPTION_ID, HEADER_PUBLIC_CUSTOM_DATA,
-            INNER_HEADER_BINARY_ATTACHMENTS, INNER_HEADER_END, INNER_HEADER_RANDOM_STREAM_ID,
-            INNER_HEADER_RANDOM_STREAM_KEY,
+            KDBX4OuterHeader, HEADER_COMMENT, HEADER_COMPRESSION_ID, HEADER_ENCRYPTION_IV,
+            HEADER_END, HEADER_KDF_PARAMS, HEADER_MASTER_SEED, HEADER_OUTER_ENCRYPTION_ID,
+            HEADER_PUBLIC_CUSTOM_DATA, INNER_HEADER_BINARY_ATTACHMENTS, INNER_HEADER_END,
+            INNER_HEADER_RANDOM_STREAM_ID, INNER_HEADER_RANDOM_STREAM_KEY,
         },
         DatabaseVersion,
     },
@@ -33,7 +33,10 @@ impl From<&[u8]> for HeaderAttachment {
 }
 
 /// Open, decrypt and parse a KeePass database from a source and key elements
-pub(crate) fn parse_kdbx4(data: &[u8], db_key: &DatabaseKey) -> Result<Database, DatabaseOpenError> {
+pub(crate) fn parse_kdbx4(
+    data: &[u8],
+    db_key: &DatabaseKey,
+) -> Result<Database, DatabaseOpenError> {
     let (config, header_attachments, mut inner_decryptor, xml) = decrypt_kdbx4(data, db_key)?;
 
     let xml = zeroize::Zeroizing::new(xml);
@@ -55,7 +58,15 @@ pub(crate) fn parse_kdbx4(data: &[u8], db_key: &DatabaseKey) -> Result<Database,
 pub(crate) fn decrypt_kdbx4(
     data: &[u8],
     db_key: &DatabaseKey,
-) -> Result<(DatabaseConfig, Vec<HeaderAttachment>, Box<dyn Cipher>, Vec<u8>), DatabaseOpenError> {
+) -> Result<
+    (
+        DatabaseConfig,
+        Vec<HeaderAttachment>,
+        Box<dyn Cipher>,
+        Vec<u8>,
+    ),
+    DatabaseOpenError,
+> {
     // parse header
     let (outer_header, inner_header_start) = parse_outer_header(data)?;
 
@@ -81,11 +92,16 @@ pub(crate) fn decrypt_kdbx4(
     let key_elements = db_key.get_key_elements()?;
     let key_elements: Vec<&[u8]> = key_elements.iter().map(|v| &v[..]).collect();
     let composite_key = zeroize::Zeroizing::new(crypt::calculate_sha256(&key_elements)?);
-    let transformed_key = zeroize::Zeroizing::new(outer_header
-        .kdf_config
-        .get_kdf_seeded(&outer_header.kdf_seed)
-        .transform_key(&composite_key)?);
-    let master_key = zeroize::Zeroizing::new(crypt::calculate_sha256(&[outer_header.master_seed.as_ref(), &transformed_key])?);
+    let transformed_key = zeroize::Zeroizing::new(
+        outer_header
+            .kdf_config
+            .get_kdf_seeded(&outer_header.kdf_seed)
+            .transform_key(&composite_key)?,
+    );
+    let master_key = zeroize::Zeroizing::new(crypt::calculate_sha256(&[
+        outer_header.master_seed.as_ref(),
+        &transformed_key,
+    ])?);
 
     // verify credentials
     let hmac_key = zeroize::Zeroizing::new(crypt::calculate_sha512(&[
@@ -93,24 +109,33 @@ pub(crate) fn decrypt_kdbx4(
         &transformed_key,
         &hmac_block_stream::HMAC_KEY_END,
     ])?);
-    let header_hmac_key = zeroize::Zeroizing::new(hmac_block_stream::get_hmac_block_key(u64::MAX, &hmac_key)?);
-    if !bool::from(subtle::ConstantTimeEq::ct_eq(header_hmac, crypt::calculate_hmac(&[header_data], &header_hmac_key)?.as_slice())) {
+    let header_hmac_key =
+        zeroize::Zeroizing::new(hmac_block_stream::get_hmac_block_key(u64::MAX, &hmac_key)?);
+    if !bool::from(subtle::ConstantTimeEq::ct_eq(
+        header_hmac,
+        crypt::calculate_hmac(&[header_data], &header_hmac_key)?.as_slice(),
+    )) {
         return Err(DatabaseKeyError::IncorrectKey.into());
     }
 
     // read encrypted payload from hmac-verified block stream
-    let payload_encrypted = hmac_block_stream::read_hmac_block_stream(hmac_block_stream, &hmac_key)?;
+    let payload_encrypted =
+        hmac_block_stream::read_hmac_block_stream(hmac_block_stream, &hmac_key)?;
 
     // Decrypt and decompress encrypted payload
-    let payload_compressed = zeroize::Zeroizing::new(outer_header
-        .outer_cipher_config
-        .get_cipher(&master_key, &outer_header.outer_iv)?
-        .decrypt(&payload_encrypted)?);
+    let payload_compressed = zeroize::Zeroizing::new(
+        outer_header
+            .outer_cipher_config
+            .get_cipher(&master_key, &outer_header.outer_iv)?
+            .decrypt(&payload_encrypted)?,
+    );
 
-    let payload = zeroize::Zeroizing::new(outer_header
-        .compression_config
-        .get_compression()
-        .decompress(&payload_compressed)?);
+    let payload = zeroize::Zeroizing::new(
+        outer_header
+            .compression_config
+            .get_compression()
+            .decompress(&payload_compressed)?,
+    );
 
     // KDBX4 has inner header, too - parse it
     let (header_attachments, inner_header, body_start) = parse_inner_header(&payload)?;
@@ -161,13 +186,17 @@ fn parse_outer_header(data: &[u8]) -> Result<(KDBX4OuterHeader, usize), Database
         //   entry_buffer: [u8; entry_length]       // the entry buffer
         // )
 
-        let prefix = data.get(pos..pos.saturating_add(5))
+        let prefix = data
+            .get(pos..pos.saturating_add(5))
             .ok_or(DatabaseIntegrityError::InvalidFixedHeader { size: data.len() })?;
         let entry_type = prefix[0];
         let entry_length = LittleEndian::read_u32(&prefix[1..]) as usize;
-        let end = pos.checked_add(5).and_then(|v|v.checked_add(entry_length))
+        let end = pos
+            .checked_add(5)
+            .and_then(|v| v.checked_add(entry_length))
             .ok_or(DatabaseIntegrityError::InvalidFixedHeader { size: data.len() })?;
-        let entry_buffer = data.get(pos + 5..end)
+        let entry_buffer = data
+            .get(pos + 5..end)
             .ok_or(DatabaseIntegrityError::InvalidFixedHeader { size: data.len() })?;
 
         pos += 5 + entry_length;
@@ -184,7 +213,9 @@ fn parse_outer_header(data: &[u8]) -> Result<(KDBX4OuterHeader, usize), Database
             }
 
             HEADER_COMPRESSION_ID => {
-                compression_config = Some(CompressionConfig::try_from(LittleEndian::read_u32(entry_buffer))?);
+                compression_config = Some(CompressionConfig::try_from(LittleEndian::read_u32(
+                    entry_buffer,
+                ))?);
             }
 
             HEADER_MASTER_SEED => master_seed = Some(entry_buffer.to_vec()),
@@ -247,16 +278,21 @@ fn parse_inner_header(
 
     let mut inner_random_stream = None;
     let mut inner_random_stream_key = None;
-    let header_attachments = Vec::new();
+    let mut header_attachments = Vec::new();
+    let mut binary_bytes = 0usize;
 
     loop {
-        let prefix = data.get(pos..pos.saturating_add(5))
+        let prefix = data
+            .get(pos..pos.saturating_add(5))
             .ok_or(DatabaseIntegrityError::InvalidFixedHeader { size: data.len() })?;
         let entry_type = prefix[0];
         let entry_length = LittleEndian::read_u32(&prefix[1..]) as usize;
-        let end = pos.checked_add(5).and_then(|v|v.checked_add(entry_length))
+        let end = pos
+            .checked_add(5)
+            .and_then(|v| v.checked_add(entry_length))
             .ok_or(DatabaseIntegrityError::InvalidFixedHeader { size: data.len() })?;
-        let entry_buffer = data.get(pos + 5..end)
+        let entry_buffer = data
+            .get(pos + 5..end)
             .ok_or(DatabaseIntegrityError::InvalidFixedHeader { size: data.len() })?;
 
         pos += 5 + entry_length;
@@ -265,13 +301,35 @@ fn parse_inner_header(
             INNER_HEADER_END => break,
 
             INNER_HEADER_RANDOM_STREAM_ID => {
-                if entry_buffer.len()!=4 { return Err(DatabaseOpenError::UnsupportedVersion); }
-                inner_random_stream = Some(InnerCipherConfig::try_from(LittleEndian::read_u32(entry_buffer))?);
+                if entry_buffer.len() != 4 {
+                    return Err(DatabaseOpenError::UnsupportedVersion);
+                }
+                inner_random_stream = Some(InnerCipherConfig::try_from(LittleEndian::read_u32(
+                    entry_buffer,
+                ))?);
             }
 
             INNER_HEADER_RANDOM_STREAM_KEY => inner_random_stream_key = Some(entry_buffer.to_vec()),
 
-            INNER_HEADER_BINARY_ATTACHMENTS => { return Err(DatabaseOpenError::UnsupportedVersion); }
+            INNER_HEADER_BINARY_ATTACHMENTS => {
+                if entry_buffer.is_empty() || entry_buffer[0] & !1 != 0 {
+                    return Err(DatabaseOpenError::UnsupportedVersion);
+                }
+                binary_bytes = binary_bytes
+                    .checked_add(entry_buffer.len() - 1)
+                    .ok_or(DatabaseIntegrityError::InvalidFixedHeader { size: data.len() })?;
+                if header_attachments.len() >= 256
+                    || entry_buffer.len() - 1 > 8 * 1024 * 1024
+                    || binary_bytes > 16 * 1024 * 1024
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Attachment resource limit exceeded",
+                    )
+                    .into());
+                }
+                header_attachments.push(HeaderAttachment::from(entry_buffer));
+            }
 
             _ => {
                 return Err(DatabaseIntegrityError::InvalidInnerHeaderEntry { entry_type }.into());
@@ -289,11 +347,13 @@ fn parse_inner_header(
     let inner_random_stream_key = get_or_err(inner_random_stream_key, "Inner random stream key")?;
 
     let valid_key = match inner_random_stream {
-        InnerCipherConfig::ChaCha20 => [32,64].contains(&inner_random_stream_key.len()),
-        InnerCipherConfig::Salsa20 => inner_random_stream_key.len()==32,
+        InnerCipherConfig::ChaCha20 => [32, 64].contains(&inner_random_stream_key.len()),
+        InnerCipherConfig::Salsa20 => inner_random_stream_key.len() == 32,
         InnerCipherConfig::Plain => false,
     };
-    if !valid_key { return Err(DatabaseOpenError::UnsupportedVersion); }
+    if !valid_key {
+        return Err(DatabaseOpenError::UnsupportedVersion);
+    }
     let inner_header = KDBX4InnerHeader {
         inner_random_stream,
         inner_random_stream_key,

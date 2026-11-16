@@ -1517,9 +1517,10 @@ dependencies = [
 
 [[package]]
 name = "passwords-keeper"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
+ "base64 0.22.1",
  "bytemuck",
  "egui",
  "egui-winit",
@@ -1542,6 +1543,7 @@ dependencies = [
  "windows-sys 0.61.2",
  "winit",
  "winresource",
+ "xml-rs",
  "zeroize",
 ]
 

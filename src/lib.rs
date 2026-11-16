@@ -1,6 +1,8 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub mod credentials;
 pub mod error;
 pub mod i18n;
+pub mod keyfile;
 pub mod native;
 pub mod preflight;
 pub mod security;

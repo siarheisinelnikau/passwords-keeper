@@ -1,12 +1,13 @@
 use crate::{
+    credentials::Credentials,
     error::{Result, VaultError},
     preflight,
     storage::{self, Fingerprint},
 };
 use keepass::{
-    Database, DatabaseKey,
+    Database,
     config::{DatabaseConfig, InnerCipherConfig, KdfConfig, OuterCipherConfig},
-    db::{Entry, Group, Node, Times, Value},
+    db::{Entry, Group, HeaderAttachment, Node, Times, Value},
     secret::SecStr,
 };
 use std::{
@@ -27,7 +28,16 @@ pub struct EntryDraft {
     pub password: String,
     pub url: String,
     pub notes: String,
+    pub attachments: Vec<AttachmentSummary>,
 }
+#[derive(Clone, Default, Zeroize, ZeroizeOnDrop, serde::Serialize, serde::Deserialize)]
+pub struct AttachmentSummary {
+    pub name: String,
+    pub size: usize,
+}
+pub const MAX_ATTACHMENT: usize = 8 * 1024 * 1024;
+pub const MAX_ATTACHMENT_TOTAL: usize = 16 * 1024 * 1024;
+pub const MAX_ATTACHMENTS: usize = 256;
 impl std::fmt::Debug for EntryDraft {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("EntryDraft([REDACTED])")
@@ -56,7 +66,7 @@ pub struct Catalog {
 
 pub struct Vault {
     db: Database,
-    password: Zeroizing<String>,
+    credentials: Credentials,
     pub path: PathBuf,
     stamp: Option<Fingerprint>,
     pub dirty: bool,
@@ -71,12 +81,18 @@ pub struct SealedVault {
 }
 impl SealedVault {
     pub fn unlock(&self, password: Zeroizing<String>) -> Result<(Vault, Option<EntryDraft>)> {
+        self.unlock_with_credentials(Credentials::password(password))
+    }
+    pub fn unlock_with_credentials(
+        &self,
+        credentials: Credentials,
+    ) -> Result<(Vault, Option<EntryDraft>)> {
         preflight::check(&self.data)?;
-        let db = Database::parse(&self.data, DatabaseKey::new().with_password(&password))
+        let db = Database::parse(&self.data, credentials.database_key())
             .map_err(|_| VaultError::Credentials)?;
         let mut vault = Vault {
             db,
-            password,
+            credentials,
             path: self.path.clone(),
             stamp: self.stamp.clone(),
             dirty: self.dirty,
@@ -92,6 +108,11 @@ impl SealedVault {
                 password: e.get_password().unwrap_or_default().into(),
                 url: e.get_url().unwrap_or_default().into(),
                 notes: e.get("Notes").unwrap_or_default().into(),
+                attachments: if let Some(id) = id {
+                    vault.attachment_summaries(id)?
+                } else {
+                    Vec::new()
+                },
             };
             wipe_entry(&mut e);
             Some(draft)
@@ -104,13 +125,17 @@ impl SealedVault {
 }
 impl Vault {
     pub fn authenticate(&self, password: &str) -> bool {
-        use subtle::ConstantTimeEq;
-        self.password.as_bytes().ct_eq(password.as_bytes()).into()
+        self.credentials
+            .matches(&Credentials::password(Zeroizing::new(password.to_owned())))
+    }
+    pub fn authenticate_credentials(&self, credentials: &Credentials) -> bool {
+        self.credentials.matches(credentials)
     }
     pub fn create(path: PathBuf, password: Zeroizing<String>) -> Result<Self> {
-        if password.chars().count() < 12 || password.len() > 4096 {
-            return Err(VaultError::InvalidEntry);
-        }
+        Self::create_with_credentials(path, Credentials::password(password))
+    }
+    pub fn create_with_credentials(path: PathBuf, credentials: Credentials) -> Result<Self> {
+        credentials.validate(true)?;
         let config = DatabaseConfig {
             kdf_config: KdfConfig::Argon2id {
                 iterations: 3,
@@ -126,41 +151,43 @@ impl Vault {
         let path = storage::absolute(&path)?;
         Ok(Self {
             db,
-            password,
+            credentials,
             path,
             stamp: None,
             dirty: true,
         })
     }
     pub fn open(path: PathBuf, password: Zeroizing<String>) -> Result<Self> {
+        Self::open_with_credentials(path, Credentials::password(password))
+    }
+    pub fn open_with_credentials(path: PathBuf, credentials: Credentials) -> Result<Self> {
+        credentials.validate(false)?;
         let path = storage::absolute(&path)?;
         let (data, stamp) = storage::read(&path)?;
         preflight::check(&data)?;
-        let db = Database::parse(&data, DatabaseKey::new().with_password(&password)).map_err(
-            |e| match e {
-                keepass::error::DatabaseOpenError::Key(_) => VaultError::Credentials,
-                keepass::error::DatabaseOpenError::UnsupportedVersion => VaultError::Unsupported,
-                keepass::error::DatabaseOpenError::DatabaseIntegrity(
-                    keepass::error::DatabaseIntegrityError::Xml(
-                        keepass::error::XmlParseError::Unsupported,
-                    ),
-                ) => VaultError::Unsupported,
-                keepass::error::DatabaseOpenError::DatabaseIntegrity(
-                    keepass::error::DatabaseIntegrityError::Xml(
-                        keepass::error::XmlParseError::ResourceLimit,
-                    ),
-                ) => VaultError::Limit,
-                keepass::error::DatabaseOpenError::Io(ref e)
-                    if e.kind() == std::io::ErrorKind::InvalidData =>
-                {
-                    VaultError::Limit
-                }
-                _ => VaultError::Corrupt,
-            },
-        )?;
+        let db = Database::parse(&data, credentials.database_key()).map_err(|e| match e {
+            keepass::error::DatabaseOpenError::Key(_) => VaultError::Credentials,
+            keepass::error::DatabaseOpenError::UnsupportedVersion => VaultError::Unsupported,
+            keepass::error::DatabaseOpenError::DatabaseIntegrity(
+                keepass::error::DatabaseIntegrityError::Xml(
+                    keepass::error::XmlParseError::Unsupported,
+                ),
+            ) => VaultError::Unsupported,
+            keepass::error::DatabaseOpenError::DatabaseIntegrity(
+                keepass::error::DatabaseIntegrityError::Xml(
+                    keepass::error::XmlParseError::ResourceLimit,
+                ),
+            ) => VaultError::Limit,
+            keepass::error::DatabaseOpenError::Io(ref e)
+                if e.kind() == std::io::ErrorKind::InvalidData =>
+            {
+                VaultError::Limit
+            }
+            _ => VaultError::Corrupt,
+        })?;
         let mut vault = Self {
             db,
-            password,
+            credentials,
             path,
             stamp: Some(stamp),
             dirty: false,
@@ -169,9 +196,7 @@ impl Vault {
         Ok(vault)
     }
     fn validate_and_protect(&mut self) -> Result<()> {
-        if !self.db.header_attachments.is_empty() {
-            return Err(VaultError::Unsupported);
-        }
+        self.compact_attachments()?;
         fn visit(
             group: &mut Group,
             depth: usize,
@@ -264,6 +289,7 @@ impl Vault {
             password: e.get_password().unwrap_or_default().into(),
             url: e.get_url().unwrap_or_default().into(),
             notes: e.get("Notes").unwrap_or_default().into(),
+            attachments: self.attachment_summaries(id)?,
         })
     }
     pub fn put(&mut self, draft: &EntryDraft) -> Result<Uuid> {
@@ -360,6 +386,7 @@ impl Vault {
     pub fn delete_entry(&mut self, id: Uuid) -> Result<()> {
         let mut e = take_entry(&mut self.db.root, id).ok_or(VaultError::NotFound)?;
         wipe_entry(&mut e);
+        self.compact_attachments()?;
         self.dirty = true;
         Ok(())
     }
@@ -388,9 +415,12 @@ impl Vault {
         Ok(())
     }
     pub fn encrypted(&self) -> Result<Vec<u8>> {
+        self.encrypted_with_credentials(&self.credentials)
+    }
+    fn encrypted_with_credentials(&self, credentials: &Credentials) -> Result<Vec<u8>> {
         let mut data = Vec::new();
         self.db
-            .save(&mut data, DatabaseKey::new().with_password(&self.password))
+            .save(&mut data, credentials.database_key())
             .map_err(|_| VaultError::Corrupt)?;
         preflight::check(&data)?;
         Ok(data)
@@ -404,6 +434,32 @@ impl Vault {
         self.stamp = Some(stamp);
         self.dirty = false;
         Ok(())
+    }
+    pub fn rekey(
+        &mut self,
+        credentials: Credentials,
+        cancel: &AtomicBool,
+    ) -> Result<Option<PathBuf>> {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(VaultError::Cancelled);
+        }
+        credentials.validate(true)?;
+        let bytes = self.encrypted_with_credentials(&credentials)?;
+        let result = storage::save(&self.path, &bytes, self.stamp.as_ref(), cancel);
+        let warning = match result {
+            Ok(stamp) => {
+                self.stamp = Some(stamp);
+                None
+            }
+            Err(VaultError::ConflictRecovered(path)) => {
+                self.stamp = Some(Fingerprint::of(&bytes));
+                Some(path)
+            }
+            Err(error) => return Err(error),
+        };
+        self.credentials = credentials;
+        self.dirty = false;
+        Ok(warning)
     }
     pub fn export(&self, path: &Path) -> Result<()> {
         if storage::absolute(path)? == self.path {
@@ -471,6 +527,180 @@ impl Vault {
         };
         self.db.config.inner_cipher_config = InnerCipherConfig::ChaCha20;
         self.dirty = true;
+    }
+    pub fn attachment_summaries(&self, id: Uuid) -> Result<Vec<AttachmentSummary>> {
+        let entry = find_entry(&self.db.root, id).ok_or(VaultError::NotFound)?;
+        let mut items = Vec::new();
+        for (name, index) in &entry.attachments {
+            let binary = self
+                .db
+                .header_attachments
+                .get(*index)
+                .ok_or(VaultError::Corrupt)?;
+            items.push(AttachmentSummary {
+                name: name.clone(),
+                size: binary.content.len(),
+            });
+        }
+        items.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(items)
+    }
+    fn compact_attachments(&mut self) -> Result<()> {
+        let pool = &self.db.header_attachments;
+        if pool.len() > MAX_ATTACHMENTS
+            || pool.iter().any(|a| a.content.len() > MAX_ATTACHMENT)
+            || pool.iter().map(|a| a.content.len()).sum::<usize>() > MAX_ATTACHMENT_TOTAL
+        {
+            return Err(VaultError::Limit);
+        }
+        let mut used = std::collections::BTreeSet::new();
+        let mut invalid = false;
+        visit_entries(&self.db.root, &mut |entry| {
+            entry.visit_attachments(&mut |name, index| {
+                if name.is_empty()
+                    || name.len() > 256
+                    || name.chars().any(char::is_control)
+                    || index >= pool.len()
+                {
+                    invalid = true;
+                }
+                used.insert(index);
+            })
+        });
+        if invalid {
+            return Err(VaultError::Corrupt);
+        }
+        let mut mapping = vec![0; pool.len()];
+        let mut compact = Vec::new();
+        for (index, binary) in self.db.header_attachments.drain(..).enumerate() {
+            if used.contains(&index) {
+                mapping[index] = compact.len();
+                compact.push(binary);
+            }
+        }
+        visit_entries_mut(&mut self.db.root, &mut |entry| {
+            entry.visit_attachments_mut(&mut |index| *index = mapping[*index])
+        });
+        self.db.header_attachments = compact;
+        Ok(())
+    }
+    pub fn add_attachment(&mut self, id: Uuid, path: &Path) -> Result<()> {
+        use std::io::Read;
+        if find_entry(&self.db.root, id).is_none() {
+            return Err(VaultError::NotFound);
+        }
+        let name = path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .ok_or(VaultError::InvalidEntry)?
+            .to_owned();
+        if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
+            return Err(VaultError::InvalidEntry);
+        }
+        if find_entry(&self.db.root, id).is_some_and(|e| e.attachments.contains_key(&name)) {
+            return Err(VaultError::AttachmentExists);
+        }
+        let file = std::fs::File::open(path)?;
+        if file.metadata()?.len() > MAX_ATTACHMENT as u64 {
+            return Err(VaultError::Limit);
+        }
+        let mut bytes = Zeroizing::new(Vec::new());
+        file.take(MAX_ATTACHMENT as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_ATTACHMENT {
+            return Err(VaultError::Limit);
+        }
+        self.compact_attachments()?;
+        let index = if let Some(index) = self
+            .db
+            .header_attachments
+            .iter()
+            .position(|v| v.content == *bytes)
+        {
+            index
+        } else {
+            if self.db.header_attachments.len() >= MAX_ATTACHMENTS
+                || self
+                    .db
+                    .header_attachments
+                    .iter()
+                    .map(|a| a.content.len())
+                    .sum::<usize>()
+                    + bytes.len()
+                    > MAX_ATTACHMENT_TOTAL
+            {
+                return Err(VaultError::Limit);
+            }
+            let index = self.db.header_attachments.len();
+            self.db.header_attachments.push(HeaderAttachment {
+                flags: 1,
+                content: std::mem::take(&mut *bytes),
+            });
+            index
+        };
+        let entry = find_entry_mut(&mut self.db.root, id).ok_or(VaultError::NotFound)?;
+        entry.attachments.insert(name, index);
+        entry.times.set_last_modification(Times::now());
+        self.dirty = true;
+        Ok(())
+    }
+    pub fn remove_attachment(&mut self, id: Uuid, name: &str) -> Result<()> {
+        let entry = find_entry_mut(&mut self.db.root, id).ok_or(VaultError::NotFound)?;
+        entry.attachments.remove(name).ok_or(VaultError::NotFound)?;
+        entry.times.set_last_modification(Times::now());
+        self.compact_attachments()?;
+        self.dirty = true;
+        Ok(())
+    }
+    pub fn export_attachment(&self, id: Uuid, name: &str, path: &Path) -> Result<()> {
+        use std::io::Write;
+        let entry = find_entry(&self.db.root, id).ok_or(VaultError::NotFound)?;
+        let index = entry.attachments.get(name).ok_or(VaultError::NotFound)?;
+        let binary = self
+            .db
+            .header_attachments
+            .get(*index)
+            .ok_or(VaultError::Corrupt)?;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        file.write_all(&binary.content)?;
+        file.as_file().sync_all()?;
+        file.persist_noclobber(path)
+            .map_err(|e| VaultError::Io(e.error))?;
+        Ok(())
+    }
+}
+fn find_entry(g: &Group, id: Uuid) -> Option<&Entry> {
+    g.children.iter().find_map(|node| match node {
+        Node::Entry(e) if e.uuid == id => Some(e),
+        Node::Group(g) => find_entry(g, id),
+        _ => None,
+    })
+}
+fn find_entry_mut(g: &mut Group, id: Uuid) -> Option<&mut Entry> {
+    g.children.iter_mut().find_map(|node| match node {
+        Node::Entry(e) if e.uuid == id => Some(e),
+        Node::Group(g) => find_entry_mut(g, id),
+        _ => None,
+    })
+}
+fn visit_entries(g: &Group, f: &mut impl FnMut(&Entry)) {
+    for node in &g.children {
+        match node {
+            Node::Entry(e) => f(e),
+            Node::Group(g) => visit_entries(g, f),
+        }
+    }
+}
+fn visit_entries_mut(g: &mut Group, f: &mut impl FnMut(&mut Entry)) {
+    for node in &mut g.children {
+        match node {
+            Node::Entry(e) => f(e),
+            Node::Group(g) => visit_entries_mut(g, f),
+        }
     }
 }
 fn keepass_argon_version() -> argon2::Version {

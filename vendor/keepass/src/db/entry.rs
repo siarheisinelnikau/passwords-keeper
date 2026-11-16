@@ -19,6 +19,8 @@ use crate::db::otp::{TOTPError, TOTP};
 pub struct Entry {
     pub uuid: Uuid,
     pub fields: HashMap<String, Value>,
+    /// Attachment filenames mapped to KDBX inner-header binary indices.
+    pub attachments: HashMap<String, usize>,
     pub autotype: Option<AutoType>,
     pub tags: Vec<String>,
 
@@ -83,11 +85,11 @@ impl Entry {
             return Ok((None, log));
         }
 
-        let (mut merged_entry, entry_merge_log) = match destination_last_modification > source_last_modification
-        {
-            true => self.merge_history(other)?,
-            false => other.clone().merge_history(self)?,
-        };
+        let (mut merged_entry, entry_merge_log) =
+            match destination_last_modification > source_last_modification {
+                true => self.merge_history(other)?,
+                false => other.clone().merge_history(self)?,
+            };
 
         // The location changed timestamp is handled separately when merging two databases.
         if let Some(location_changed_timestamp) = self.times.get_location_changed() {
@@ -322,7 +324,9 @@ impl serde::Serialize for Value {
         match self {
             Value::Bytes(b) => serializer.serialize_bytes(b),
             Value::Unprotected(u) => serializer.serialize_str(u),
-            Value::Protected(p) => serializer.serialize_str(String::from_utf8_lossy(p.unsecure()).as_ref()),
+            Value::Protected(p) => {
+                serializer.serialize_str(String::from_utf8_lossy(p.unsecure()).as_ref())
+            }
         }
     }
 }
@@ -418,7 +422,8 @@ impl History {
             }
         }
 
-        let mut all_modification_times: Vec<&chrono::NaiveDateTime> = new_history_entries.keys().collect();
+        let mut all_modification_times: Vec<&chrono::NaiveDateTime> =
+            new_history_entries.keys().collect();
         all_modification_times.sort();
         all_modification_times.reverse();
         let mut new_entries: Vec<Entry> = vec![];
@@ -470,9 +475,10 @@ mod entry_tests {
         let mut entry = Entry::new();
         let mut last_modification_time = *entry.times.get_last_modification().unwrap();
 
-        entry
-            .fields
-            .insert("Username".to_string(), Value::Unprotected("user".to_string()));
+        entry.fields.insert(
+            "Username".to_string(),
+            Value::Unprotected("user".to_string()),
+        );
         // Making sure to wait 1 sec before update the history, to make
         // sure that we get a different modification timestamp.
         thread::sleep(time::Duration::from_secs(1));
@@ -497,9 +503,10 @@ mod entry_tests {
             &last_modification_time
         );
 
-        entry
-            .fields
-            .insert("Title".to_string(), Value::Unprotected("first title".to_string()));
+        entry.fields.insert(
+            "Title".to_string(),
+            Value::Unprotected("first title".to_string()),
+        );
 
         assert!(entry.update_history());
         assert!(entry.history.is_some());
@@ -573,7 +580,8 @@ mod entry_tests {
         );
 
         assert_eq!(
-            serde_json::to_string(&Value::Protected(SecStr::new("ABC".as_bytes().to_vec()))).unwrap(),
+            serde_json::to_string(&Value::Protected(SecStr::new("ABC".as_bytes().to_vec())))
+                .unwrap(),
             "\"ABC\"".to_string()
         );
     }
@@ -590,9 +598,38 @@ impl Entry {
                 Value::Protected(_) => {}
             }
         }
-        if let Some(history)=self.history.as_mut() {
-            for entry in &mut history.entries { entry.erase_owned_fields(); }
+        if let Some(history) = self.history.as_mut() {
+            for entry in &mut history.entries {
+                entry.erase_owned_fields();
+            }
         }
-        self.tags.zeroize(); self.override_url.zeroize();
+        self.tags.zeroize();
+        self.override_url.zeroize();
+        for (mut name, mut index) in self.attachments.drain() {
+            name.zeroize();
+            index.zeroize();
+        }
+    }
+    /// Visit references in this entry and every historical version.
+    pub fn visit_attachments(&self, f: &mut impl FnMut(&str, usize)) {
+        for (name, index) in &self.attachments {
+            f(name, *index);
+        }
+        if let Some(history) = &self.history {
+            for entry in &history.entries {
+                entry.visit_attachments(f);
+            }
+        }
+    }
+    /// Remap binary indices, including shared references from entry history.
+    pub fn visit_attachments_mut(&mut self, f: &mut impl FnMut(&mut usize)) {
+        for index in self.attachments.values_mut() {
+            f(index);
+        }
+        if let Some(history) = &mut self.history {
+            for entry in &mut history.entries {
+                entry.visit_attachments_mut(f);
+            }
+        }
     }
 }

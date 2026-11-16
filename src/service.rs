@@ -1,7 +1,8 @@
 use crate::{
+    credentials::CredentialsInput,
     error::{Result, VaultError},
     security::{Clipboard, ClipboardLease},
-    vault::{Catalog, EntryDraft, SealedVault, Vault},
+    vault::{AttachmentSummary, Catalog, EntryDraft, SealedVault, Vault},
 };
 use std::{
     path::PathBuf,
@@ -15,10 +16,27 @@ use zeroize::Zeroizing;
 pub enum Command {
     Open {
         path: PathBuf,
-        password: Zeroizing<String>,
+        credentials: CredentialsInput,
         create: bool,
     },
-    Unlock(Zeroizing<String>),
+    Unlock(CredentialsInput),
+    Rekey {
+        credentials: CredentialsInput,
+        cancel: Arc<AtomicBool>,
+    },
+    AddAttachment {
+        entry: Uuid,
+        path: PathBuf,
+    },
+    RemoveAttachment {
+        entry: Uuid,
+        name: String,
+    },
+    ExportAttachment {
+        entry: Uuid,
+        name: String,
+        path: PathBuf,
+    },
     Entry(Uuid),
     Apply(EntryDraft),
     Save {
@@ -46,6 +64,16 @@ pub enum Response {
         saved: bool,
     },
     Entry(EntryDraft),
+    Attachments {
+        entry: Uuid,
+        catalog: Catalog,
+        items: Vec<AttachmentSummary>,
+        exported: bool,
+    },
+    Rekeyed {
+        catalog: Catalog,
+        warning: Option<PathBuf>,
+    },
     Locked {
         unsaved: bool,
     },
@@ -76,18 +104,19 @@ impl Engine {
         match command {
             Command::Open {
                 path,
-                password,
+                credentials,
                 create,
             } => {
                 if self.vault.is_some() || self.sealed.is_some() {
                     return Err(VaultError::Busy);
                 }
+                let credentials = credentials.load()?;
                 let mut v = if create {
-                    let mut v = Vault::create(path, password)?;
+                    let mut v = Vault::create_with_credentials(path, credentials)?;
                     v.save(&AtomicBool::new(false))?;
                     v
                 } else {
-                    Vault::open(path, password)?
+                    Vault::open_with_credentials(path, credentials)?
                 };
                 let catalog = v.catalog();
                 let path = v.path.clone();
@@ -99,12 +128,13 @@ impl Engine {
                     draft: None,
                 })
             }
-            Command::Unlock(password) => {
+            Command::Unlock(credentials) => {
+                let credentials = credentials.load()?;
                 let (v, draft) = if let Some(sealed) = self.sealed.as_ref() {
-                    sealed.unlock(password)?
+                    sealed.unlock_with_credentials(credentials)?
                 } else {
                     let v = self.vault.as_ref().ok_or(VaultError::Locked)?;
-                    if !v.authenticate(&password) {
+                    if !v.authenticate_credentials(&credentials) {
                         return Err(VaultError::Credentials);
                     }
                     (
@@ -146,6 +176,45 @@ impl Engine {
                 let mut selected = None;
                 let mut saved = false;
                 match command {
+                    Command::Rekey {
+                        credentials,
+                        cancel,
+                    } => {
+                        let credentials = credentials.load()?;
+                        credentials.validate(true)?;
+                        let warning = v.rekey(credentials, &cancel)?;
+                        return Ok(Response::Rekeyed {
+                            catalog: v.catalog(),
+                            warning,
+                        });
+                    }
+                    Command::AddAttachment { entry, path } => {
+                        v.add_attachment(entry, &path)?;
+                        return Ok(Response::Attachments {
+                            entry,
+                            catalog: v.catalog(),
+                            items: v.attachment_summaries(entry)?,
+                            exported: false,
+                        });
+                    }
+                    Command::RemoveAttachment { entry, name } => {
+                        v.remove_attachment(entry, &name)?;
+                        return Ok(Response::Attachments {
+                            entry,
+                            catalog: v.catalog(),
+                            items: v.attachment_summaries(entry)?,
+                            exported: false,
+                        });
+                    }
+                    Command::ExportAttachment { entry, name, path } => {
+                        v.export_attachment(entry, &name, &path)?;
+                        return Ok(Response::Attachments {
+                            entry,
+                            catalog: v.catalog(),
+                            items: v.attachment_summaries(entry)?,
+                            exported: true,
+                        });
+                    }
                     Command::Apply(draft) => {
                         selected = Some(v.put(&draft)?);
                     }

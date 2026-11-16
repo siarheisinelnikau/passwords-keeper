@@ -28,6 +28,18 @@ impl DumpXml for Entry {
             writer.write(WriterEvent::end_element())?; // String
         }
 
+        let mut attachment_names: Vec<_> = self.attachments.keys().collect();
+        attachment_names.sort();
+        for name in attachment_names {
+            writer.write(WriterEvent::start_element("Binary"))?;
+            SimpleTag("Key", name).dump_xml(writer, inner_cipher)?;
+            writer.write(
+                WriterEvent::start_element("Value")
+                    .attr("Ref", &self.attachments[name].to_string()),
+            )?;
+            writer.write(WriterEvent::end_element())?;
+            writer.write(WriterEvent::end_element())?;
+        }
         self.custom_data.dump_xml(writer, inner_cipher)?;
 
         if let Some(ref value) = self.autotype {
@@ -77,9 +89,8 @@ impl DumpXml for Value {
         inner_cipher: &mut dyn Cipher,
     ) -> Result<(), xml::writer::Error> {
         match self {
-            Value::Bytes(b) => {
-                SimpleTag("Value", std::str::from_utf8(b).expect("utf-8")).dump_xml(writer, inner_cipher)
-            }
+            Value::Bytes(b) => SimpleTag("Value", std::str::from_utf8(b).expect("utf-8"))
+                .dump_xml(writer, inner_cipher),
             Value::Unprotected(s) => SimpleTag("Value", s).dump_xml(writer, inner_cipher),
             Value::Protected(p) => {
                 writer.write(WriterEvent::start_element("Value").attr("Protected", "True"))?;

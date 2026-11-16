@@ -1,5 +1,6 @@
 use egui::{self, Color32, RichText, Vec2};
 use passwords_keeper::{
+    credentials::CredentialsInput,
     error::VaultError,
     i18n,
     native::SystemEvent,
@@ -27,6 +28,17 @@ pub enum Event {
     System(SystemEvent),
     Chosen(Option<PathBuf>, bool),
     ExportChosen(Option<PathBuf>),
+    KeyFileChosen {
+        result: passwords_keeper::error::Result<Option<PathBuf>>,
+        target: KeyTarget,
+        epoch: u64,
+    },
+    AttachmentChosen {
+        path: Option<PathBuf>,
+        entry: Uuid,
+        name: Option<String>,
+        epoch: u64,
+    },
     UpdateChecked(Result<Option<Update>, updates::UpdateError>, bool),
     Progress(u8),
     Downloaded(Result<StagedUpdate, updates::UpdateError>),
@@ -43,10 +55,11 @@ enum Next {
     Quit,
     Install,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Prompt {
     Draft(Next),
     Delete(Uuid),
+    RemoveAttachment(Uuid, String),
     Quit,
     LockedQuit,
 }
@@ -56,9 +69,40 @@ enum Screen {
     Unlock,
     Workspace,
 }
+#[derive(Clone, Copy)]
+pub enum KeyTarget {
+    Unlock,
+    Rekey,
+}
+struct KeyEditor {
+    use_password: bool,
+    password: Secret,
+    confirmation: Secret,
+    key_file: Option<PathBuf>,
+}
+impl Default for KeyEditor {
+    fn default() -> Self {
+        Self {
+            use_password: true,
+            password: Secret::default(),
+            confirmation: Secret::default(),
+            key_file: None,
+        }
+    }
+}
 pub enum Effect {
     Choose(bool),
     Export,
+    KeyFile {
+        create: bool,
+        target: KeyTarget,
+        epoch: u64,
+    },
+    Attachment {
+        entry: Uuid,
+        name: Option<String>,
+        epoch: u64,
+    },
     CheckUpdates(bool),
     Download(Update),
     SavePreferences(Settings),
@@ -79,6 +123,10 @@ pub struct App {
     draft_dirty: bool,
     master: Secret,
     confirmation: Secret,
+    use_password: bool,
+    key_file: Option<PathBuf>,
+    key_editor: Option<KeyEditor>,
+    pending_rekey: Option<(bool, Option<PathBuf>)>,
     new_vault: bool,
     query: String,
     settings_open: bool,
@@ -129,6 +177,10 @@ impl App {
             draft_dirty: false,
             master: Secret::default(),
             confirmation: Secret::default(),
+            use_password: true,
+            key_file: None,
+            key_editor: None,
+            pending_rekey: None,
             new_vault: false,
             query: String::new(),
             settings_open: false,
@@ -173,7 +225,10 @@ impl App {
         i18n::text(self.prefs.language, key).into()
     }
     fn command(&mut self, command: Command) {
-        self.can_cancel = matches!(command, Command::Save { export: None, .. });
+        self.can_cancel = matches!(
+            command,
+            Command::Save { export: None, .. } | Command::Rekey { .. }
+        );
         self.busy = true;
         self.error = None;
         self.error_detail = None;
@@ -190,6 +245,7 @@ impl App {
         self.generated.0.zeroize();
         self.master.0.zeroize();
         self.confirmation.0.zeroize();
+        self.key_editor = None;
         self.query.zeroize();
         self.reveal = false;
         self.reveal_until = None;
@@ -304,6 +360,42 @@ impl App {
                         }
                         self.busy = self.locking;
                     }
+                    Response::Attachments {
+                        entry,
+                        catalog,
+                        items,
+                        exported,
+                    } => {
+                        self.busy = self.locking;
+                        if !self.locking && self.screen == Screen::Workspace {
+                            self.catalog = catalog;
+                            if let Some(draft) = self.draft.as_mut()
+                                && draft.id == Some(entry)
+                            {
+                                draft.attachments = items;
+                            }
+                            if exported {
+                                self.flash("attachment_exported");
+                            }
+                        }
+                    }
+                    Response::Rekeyed { catalog, warning } => {
+                        if let Some((use_password, key_file)) = self.pending_rekey.take() {
+                            self.use_password = use_password;
+                            self.key_file = key_file;
+                        }
+                        self.key_editor = None;
+                        self.busy = self.locking;
+                        if !self.locking && self.screen == Screen::Workspace {
+                            self.catalog = catalog;
+                            if let Some(path) = warning {
+                                self.error = Some("err_recovered_conflict");
+                                self.error_detail = Some(path);
+                            } else {
+                                self.flash("key_changed");
+                            }
+                        }
+                    }
                     Response::Catalog {
                         catalog,
                         selected,
@@ -338,10 +430,14 @@ impl App {
                         self.locked_snapshot = false;
                         self.locked_unsaved = false;
                         self.path = None;
+                        self.key_file = None;
+                        self.use_password = true;
+                        self.pending_rekey = None;
                         self.screen = Screen::Home;
                         self.clear_secrets(ctx);
                     }
                     Response::Failed { error, lock_failed } => {
+                        self.pending_rekey = None;
                         self.error_detail = if let VaultError::ConflictRecovered(path) = &error {
                             Some(path.clone())
                         } else {
@@ -372,6 +468,46 @@ impl App {
                 }
             }
             Event::ExportChosen(path) => self.export_selected(path),
+            Event::KeyFileChosen {
+                result,
+                target,
+                epoch,
+            } => {
+                if epoch != self.privacy_epoch {
+                    return;
+                }
+                self.busy = self.locking;
+                match result {
+                    Ok(Some(path)) => match target {
+                        KeyTarget::Unlock => self.key_file = Some(path),
+                        KeyTarget::Rekey => {
+                            if let Some(editor) = &mut self.key_editor {
+                                editor.key_file = Some(path);
+                            }
+                        }
+                    },
+                    Ok(None) => {}
+                    Err(error) => self.error = Some(error_key(&error)),
+                }
+            }
+            Event::AttachmentChosen {
+                path,
+                entry,
+                name,
+                epoch,
+            } => {
+                if epoch != self.privacy_epoch || self.screen != Screen::Workspace {
+                    return;
+                }
+                self.busy = self.locking;
+                if let Some(path) = path {
+                    self.command(if let Some(name) = name {
+                        Command::ExportAttachment { entry, name, path }
+                    } else {
+                        Command::AddAttachment { entry, path }
+                    });
+                }
+            }
             Event::UpdateChecked(result, startup) => {
                 self.checking = false;
                 match result {
@@ -616,6 +752,9 @@ impl App {
         if self.generator_open {
             self.password_generator(ctx);
         }
+        if self.key_editor.is_some() {
+            self.key_editor(ctx);
+        }
         if self.prompt.is_some() {
             self.prompt(ctx);
         }
@@ -685,105 +824,150 @@ impl App {
     }
     fn unlock(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(64.);
-                let create = self.new_vault && !self.locked_snapshot;
-                ui.heading(
-                    RichText::new(self.t(if create { "create" } else { "locked" })).size(30.),
-                );
-                ui.add_space(12.);
-                if let Some(path) = &self.path {
-                    ui.label(
-                        RichText::new(path.file_name().unwrap_or_default().to_string_lossy())
-                            .strong(),
-                    );
-                }
-                ui.add_space(20.);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(440., 320.),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        ui.label(self.t(if self.lock_failed {
-                            "lock_failed"
-                        } else if self.locked_unsaved {
-                            "encrypted_draft"
-                        } else if create {
-                            "master_hint"
-                        } else {
-                            "unlock_hint"
-                        }));
-                        ui.add_space(20.);
-                        ui.label(self.t("master"));
-                        let edit = ui.add_enabled(
-                            !self.busy,
-                            egui::TextEdit::singleline(&mut self.master.0)
-                                .password(true)
-                                .desired_width(f32::INFINITY)
-                                .margin(Vec2::splat(10.)),
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(24.);
+                        let create = self.new_vault && !self.locked_snapshot;
+                        ui.heading(
+                            RichText::new(self.t(if create { "create" } else { "locked" }))
+                                .size(30.),
                         );
-                        if create {
-                            ui.add_space(12.);
-                            ui.label(self.t("confirm_master"));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.confirmation.0)
-                                    .password(true)
-                                    .desired_width(f32::INFINITY)
-                                    .margin(Vec2::splat(10.)),
+                        ui.add_space(12.);
+                        if let Some(path) = &self.path {
+                            ui.label(
+                                RichText::new(
+                                    path.file_name().unwrap_or_default().to_string_lossy(),
+                                )
+                                .strong(),
                             );
                         }
-                        ui.add_space(18.);
-                        let submit = ui
-                            .add_enabled(
-                                !self.busy,
-                                egui::Button::new(self.t(if create { "create" } else { "unlock" }))
-                                    .fill(accent(self.prefs.dark))
-                                    .min_size(Vec2::new(440., 40.)),
-                            )
-                            .clicked()
-                            || (edit.lost_focus()
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                                && !self.busy);
-                        if submit {
-                            if create
-                                && (self.master.0 != self.confirmation.0
-                                    || self.master.0.chars().count() < 12)
-                            {
-                                self.error = Some("err_password");
-                            } else if self.master.0.len() > 4096 {
-                                self.error = Some("err_limit");
-                            } else {
-                                let password = Zeroizing::new(std::mem::take(&mut self.master.0));
-                                self.confirmation.0.zeroize();
-                                if self.locked_snapshot {
-                                    self.command(Command::Unlock(password));
-                                } else if let Some(path) = self.path.clone() {
-                                    self.command(Command::Open {
-                                        path,
-                                        password,
+                        ui.add_space(20.);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(440., 320.),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.label(self.t(if self.lock_failed {
+                                    "lock_failed"
+                                } else if self.locked_unsaved {
+                                    "encrypted_draft"
+                                } else if create {
+                                    "master_hint"
+                                } else {
+                                    "unlock_hint"
+                                }));
+                                ui.add_space(20.);
+                                if ui
+                                    .add_enabled(
+                                        !self.busy,
+                                        egui::Checkbox::new(
+                                            &mut self.use_password,
+                                            i18n::text(self.prefs.language, "use_master"),
+                                        ),
+                                    )
+                                    .changed()
+                                    && !self.use_password
+                                {
+                                    self.master.0.zeroize();
+                                    self.confirmation.0.zeroize();
+                                }
+                                let edit = ui.add_enabled(
+                                    !self.busy && self.use_password,
+                                    egui::TextEdit::singleline(&mut self.master.0)
+                                        .password(true)
+                                        .desired_width(f32::INFINITY)
+                                        .margin(Vec2::splat(10.)),
+                                );
+                                if create && self.use_password {
+                                    ui.add_space(12.);
+                                    ui.label(self.t("confirm_master"));
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.confirmation.0)
+                                            .password(true)
+                                            .desired_width(f32::INFINITY)
+                                            .margin(Vec2::splat(10.)),
+                                    );
+                                }
+                                ui.add_space(12.);
+                                if let Some(create) = key_file_controls(
+                                    ui,
+                                    self.prefs.language,
+                                    &mut self.key_file,
+                                    !self.busy,
+                                ) {
+                                    self.busy = true;
+                                    self.effects.push(Effect::KeyFile {
                                         create,
+                                        target: KeyTarget::Unlock,
+                                        epoch: self.privacy_epoch,
                                     });
                                 }
-                            }
-                        }
-                        ui.add_space(10.);
-                        if !self.busy
-                            && !self.locked_snapshot
-                            && ui.button(self.t("back")).clicked()
-                        {
-                            self.screen = Screen::Home;
-                            self.master.0.zeroize();
-                            self.confirmation.0.zeroize();
-                        }
-                        if !self.busy
-                            && self.locked_snapshot
-                            && !self.locked_unsaved
-                            && ui.button(self.t("vaults")).clicked()
-                        {
-                            self.command(Command::Close);
-                        }
-                    },
-                );
-            });
+                                ui.add_space(18.);
+                                let submit = ui
+                                    .add_enabled(
+                                        !self.busy,
+                                        egui::Button::new(self.t(if create {
+                                            "create"
+                                        } else {
+                                            "unlock"
+                                        }))
+                                        .fill(accent(self.prefs.dark))
+                                        .min_size(Vec2::new(440., 40.)),
+                                    )
+                                    .clicked()
+                                    || (edit.lost_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                        && !self.busy);
+                                if submit {
+                                    if let Some(error) = credential_error(
+                                        self.use_password,
+                                        &self.master.0,
+                                        &self.confirmation.0,
+                                        self.key_file.is_some(),
+                                        create,
+                                    ) {
+                                        self.error = Some(error);
+                                    } else {
+                                        let password = self.use_password.then(|| {
+                                            Zeroizing::new(std::mem::take(&mut self.master.0))
+                                        });
+                                        let credentials = CredentialsInput {
+                                            password,
+                                            key_file: self.key_file.clone(),
+                                        };
+                                        self.confirmation.0.zeroize();
+                                        if self.locked_snapshot {
+                                            self.command(Command::Unlock(credentials));
+                                        } else if let Some(path) = self.path.clone() {
+                                            self.command(Command::Open {
+                                                path,
+                                                credentials,
+                                                create,
+                                            });
+                                        }
+                                    }
+                                }
+                                ui.add_space(10.);
+                                if !self.busy
+                                    && !self.locked_snapshot
+                                    && ui.button(self.t("back")).clicked()
+                                {
+                                    self.screen = Screen::Home;
+                                    self.master.0.zeroize();
+                                    self.confirmation.0.zeroize();
+                                }
+                                if !self.busy
+                                    && self.locked_snapshot
+                                    && !self.locked_unsaved
+                                    && ui.button(self.t("vaults")).clicked()
+                                {
+                                    self.command(Command::Close);
+                                }
+                            },
+                        );
+                    });
+                });
         });
     }
     fn workspace(&mut self, ctx: &egui::Context) {
@@ -1044,6 +1228,60 @@ impl App {
                                         .margin(Vec2::splat(9.)),
                                 )
                                 .changed();
+                            ui.add_space(18.);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(t("attachments")).strong());
+                                if let Some(entry) = draft.id
+                                    && ui.small_button(t("add_attachment")).clicked()
+                                {
+                                    self.busy = true;
+                                    self.effects.push(Effect::Attachment {
+                                        entry,
+                                        name: None,
+                                        epoch: self.privacy_epoch,
+                                    });
+                                }
+                            });
+                            ui.label(
+                                RichText::new(t(if draft.id.is_none() {
+                                    "apply_before_attachment"
+                                } else {
+                                    "attachment_hint"
+                                }))
+                                .small()
+                                .color(muted(self.prefs.dark)),
+                            );
+                            if let Some(entry) = draft.id {
+                                for item in &draft.attachments {
+                                    ui.push_id(&item.name, |ui| {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(format!(
+                                                "{} · {} KiB",
+                                                item.name,
+                                                item.size.div_ceil(1024)
+                                            ));
+                                            if ui.small_button(t("save_attachment")).clicked() {
+                                                self.busy = true;
+                                                self.effects.push(Effect::Attachment {
+                                                    entry,
+                                                    name: Some(item.name.clone()),
+                                                    epoch: self.privacy_epoch,
+                                                });
+                                            }
+                                            if ui
+                                                .small_button(t("remove_key_file"))
+                                                .on_hover_text(t("remove_attachment"))
+                                                .clicked()
+                                            {
+                                                self.prompt = Some(Prompt::RemoveAttachment(
+                                                    entry,
+                                                    item.name.clone(),
+                                                ));
+                                            }
+                                        })
+                                    });
+                                }
+                            }
                             ui.add_space(20.);
                             ui.horizontal(|ui| {
                                 if ui
@@ -1091,18 +1329,25 @@ impl App {
     }
     fn settings(&mut self, ctx: &egui::Context) {
         let before = serde_json::to_string(&self.prefs).unwrap_or_default();
-        let mut open = true;
+        let mut open = self.settings_open;
+        let mut dismiss = !self.licenses_open
+            && self.key_editor.is_none()
+            && self.prompt.is_none()
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let language = self.prefs.language;
         let t = |key: &str| i18n::text(language, key).to_string();
-        egui::Window::new(t("settings"))
+        let height = (ctx.content_rect().height() - 140.).clamp(180., 560.);
+        let response = egui::Window::new(t("settings"))
             .id(egui::Id::new("settings_window"))
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
-            .default_width(540.)
+            .fixed_size(egui::vec2(560., height + 40.))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
-                    .max_height(610.)
+                    .max_height(height)
+                    .min_scrolled_height(height)
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.heading(t("appearance"));
                         ui.add_space(10.);
@@ -1133,6 +1378,21 @@ impl App {
                                 .text(t("clipboard")),
                         );
                         ui.label(t("session_lock"));
+                        if self.screen == Screen::Workspace {
+                            ui.add_space(10.);
+                            if ui
+                                .add_enabled(
+                                    !self.busy && !self.draft_dirty,
+                                    egui::Button::new(t("change_key")),
+                                )
+                                .clicked()
+                            {
+                                self.key_editor = Some(KeyEditor::default());
+                            }
+                            if self.draft_dirty {
+                                ui.label(RichText::new(t("apply_before_key")).small());
+                            }
+                        }
                         ui.add_space(22.);
                         ui.heading(t("updates"));
                         ui.add_space(10.);
@@ -1191,11 +1451,11 @@ impl App {
                                 .color(muted(self.prefs.dark)),
                         );
                         ui.add_space(22.);
-                        ui.heading(t("compatibility"));
-                        ui.add_space(10.);
-                        ui.label(t("format_limits"));
-                        ui.add_space(8.);
-                        ui.label(RichText::new(t("kdf_limits")).small());
+                        ui.collapsing(t("compatibility"), |ui| {
+                            ui.label(t("format_limits"));
+                            ui.add_space(8.);
+                            ui.label(RichText::new(t("kdf_limits")).small());
+                        });
                         ui.add_space(14.);
                         ui.label(
                             RichText::new(t("memory_note"))
@@ -1208,11 +1468,117 @@ impl App {
                             self.licenses_open = true;
                         }
                     });
+                ui.separator();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let close = ui.button(t("close_settings"));
+                    #[cfg(test)]
+                    ctx.data_mut(|data| {
+                        data.insert_temp(egui::Id::new("test_settings_close"), close.rect)
+                    });
+                    dismiss |= close.clicked();
+                });
             });
-        self.settings_open = open;
+        #[cfg(test)]
+        if let Some(response) = &response {
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("test_settings_window"),
+                    response.response.rect,
+                )
+            });
+        }
+        #[cfg(not(test))]
+        let _ = response;
+        if !open || dismiss {
+            self.settings_open = false;
+            ctx.request_repaint();
+        }
         if before != serde_json::to_string(&self.prefs).unwrap_or_default() {
             self.effects
                 .push(Effect::SavePreferences(self.prefs.clone()));
+        }
+    }
+    fn key_editor(&mut self, ctx: &egui::Context) {
+        let Some(mut editor) = self.key_editor.take() else {
+            return;
+        };
+        let language = self.prefs.language;
+        let t = |key: &str| i18n::text(language, key).to_string();
+        let mut open = true;
+        let mut dismiss = false;
+        egui::Window::new(t("change_key"))
+            .id(egui::Id::new("change_master_key"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(460.)
+            .show(ctx, |ui| {
+                ui.label(t("change_key_hint"));
+                ui.add_space(14.);
+                ui.add_enabled_ui(!self.busy, |ui| {
+                    if ui
+                        .checkbox(&mut editor.use_password, t("use_master"))
+                        .changed()
+                        && !editor.use_password
+                    {
+                        editor.password.0.zeroize();
+                        editor.confirmation.0.zeroize();
+                    }
+                    if editor.use_password {
+                        field(ui, &t("new_master"), &mut editor.password.0, true);
+                        field(ui, &t("confirm_master"), &mut editor.confirmation.0, true);
+                    }
+                    ui.add_space(12.);
+                    if let Some(create) =
+                        key_file_controls(ui, language, &mut editor.key_file, true)
+                    {
+                        self.busy = true;
+                        self.effects.push(Effect::KeyFile {
+                            create,
+                            target: KeyTarget::Rekey,
+                            epoch: self.privacy_epoch,
+                        });
+                    }
+                    ui.add_space(18.);
+                    if self.draft_dirty {
+                        ui.label(t("apply_before_key"));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!self.draft_dirty, egui::Button::new(t("change_key")))
+                            .clicked()
+                        {
+                            if let Some(error) = credential_error(
+                                editor.use_password,
+                                &editor.password.0,
+                                &editor.confirmation.0,
+                                editor.key_file.is_some(),
+                                true,
+                            ) {
+                                self.error = Some(error);
+                            } else {
+                                self.pending_rekey =
+                                    Some((editor.use_password, editor.key_file.clone()));
+                                let credentials = CredentialsInput {
+                                    password: editor.use_password.then(|| {
+                                        Zeroizing::new(std::mem::take(&mut editor.password.0))
+                                    }),
+                                    key_file: editor.key_file.clone(),
+                                };
+                                editor.confirmation.0.zeroize();
+                                self.cancel = Arc::new(AtomicBool::new(false));
+                                self.command(Command::Rekey {
+                                    credentials,
+                                    cancel: self.cancel.clone(),
+                                });
+                            }
+                        }
+                        dismiss = ui.button(t("cancel")).clicked();
+                    });
+                });
+            });
+        if self.busy || (open && !dismiss) {
+            self.key_editor = Some(editor);
         }
     }
     fn group_editor(&mut self, ctx: &egui::Context) {
@@ -1295,13 +1661,14 @@ impl App {
         }
     }
     fn prompt(&mut self, ctx: &egui::Context) {
-        let Some(prompt) = self.prompt else {
+        let Some(prompt) = self.prompt.clone() else {
             return;
         };
-        let message = match prompt {
+        let message = match &prompt {
             Prompt::Draft(Next::Home | Next::Install | Next::Quit) => "leave_prompt",
             Prompt::Draft(_) => "draft_prompt",
             Prompt::Delete(_) => "delete_confirm",
+            Prompt::RemoveAttachment(..) => "remove_attachment_confirm",
             Prompt::Quit => "quit_prompt",
             Prompt::LockedQuit => "quit_locked",
         };
@@ -1360,6 +1727,12 @@ impl App {
                             self.draft_dirty = false;
                             self.prompt = None;
                             self.command(Command::DeleteEntry(id));
+                        }
+                    }
+                    Prompt::RemoveAttachment(entry, name) => {
+                        if ui.button(self.t("remove_attachment")).clicked() {
+                            self.prompt = None;
+                            self.command(Command::RemoveAttachment { entry, name });
                         }
                     }
                 }
@@ -1484,9 +1857,61 @@ pub fn draw_mark(ui: &egui::Ui, rect: egui::Rect, dark: bool) {
         egui::Stroke::new(2.3, background(dark)),
     );
 }
+fn credential_error(
+    use_password: bool,
+    password: &str,
+    confirmation: &str,
+    key_file: bool,
+    creating: bool,
+) -> Option<&'static str> {
+    if !use_password && !key_file {
+        return Some("err_key_required");
+    }
+    if use_password && password.len() > 4096 {
+        return Some("err_limit");
+    }
+    if use_password && creating && (password != confirmation || password.chars().count() < 12) {
+        return Some("err_password");
+    }
+    None
+}
+fn key_file_controls(
+    ui: &mut egui::Ui,
+    language: Language,
+    path: &mut Option<PathBuf>,
+    enabled: bool,
+) -> Option<bool> {
+    let t = |key: &str| i18n::text(language, key).to_string();
+    let mut action = None;
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.label(t("key_file"));
+        if let Some(file) = path.as_ref() {
+            ui.label(file.file_name().unwrap_or_default().to_string_lossy())
+                .on_hover_text(file.display().to_string());
+        } else {
+            ui.label(RichText::new(t("no_key_file")).small());
+        }
+        ui.horizontal_wrapped(|ui| {
+            if ui.button(t("choose_key_file")).clicked() {
+                action = Some(false);
+            }
+            if ui.button(t("create_key_file")).clicked() {
+                action = Some(true);
+            }
+            if path.is_some() && ui.small_button(t("remove_key_file")).clicked() {
+                *path = None;
+            }
+        });
+        ui.label(RichText::new(t("key_file_hint")).small());
+    });
+    action
+}
 fn error_key(error: &VaultError) -> &'static str {
     match error {
         VaultError::Credentials => "err_credentials",
+        VaultError::CredentialsRequired => "err_key_required",
+        VaultError::KeyFile => "err_key_file",
+        VaultError::AttachmentExists => "err_attachment_exists",
         VaultError::Corrupt => "err_corrupt",
         VaultError::Unsupported => "err_unsupported",
         VaultError::Limit => "err_limit",
@@ -1536,6 +1961,149 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::CheckUpdates(_)))
         );
+    }
+    fn settings_frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(980., 640.),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                if app.settings_open {
+                    app.settings(ctx);
+                }
+            },
+        );
+    }
+    #[test]
+    fn settings_close_button_and_escape_remain_closed() {
+        let (mut app, _, ctx) = harness();
+        app.settings_open = true;
+        for _ in 0..3 {
+            settings_frame(&mut app, &ctx, vec![]);
+        }
+        let rect = ctx
+            .data(|data| data.get_temp::<egui::Rect>(egui::Id::new("test_settings_close")))
+            .unwrap();
+        assert!(
+            rect.bottom() <= 640.,
+            "close button outside the smallest viewport"
+        );
+        let pos = rect.center();
+        settings_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        settings_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+        );
+        assert!(!app.settings_open);
+        settings_frame(&mut app, &ctx, vec![]);
+        assert!(!app.settings_open);
+        app.settings_open = true;
+        settings_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
+        assert!(!app.settings_open);
+    }
+    #[test]
+    fn attachment_responses_preserve_unsaved_fields_and_stale_choosers_cannot_cross_lock() {
+        let (mut app, rx, ctx) = harness();
+        open(&mut app, &ctx);
+        let id = Uuid::new_v4();
+        let mut draft = EntryDraft::default();
+        draft.id = Some(id);
+        draft.title = "Unsaved title".into();
+        draft.password = "Unsaved secret".into();
+        app.draft = Some(draft);
+        app.draft_dirty = true;
+        app.event(
+            Event::Worker(Response::Attachments {
+                entry: id,
+                catalog: app.catalog.clone(),
+                items: vec![passwords_keeper::vault::AttachmentSummary {
+                    name: "test.bin".into(),
+                    size: 42,
+                }],
+                exported: false,
+            }),
+            &ctx,
+        );
+        assert_eq!(app.draft.as_ref().unwrap().title, "Unsaved title");
+        assert_eq!(app.draft.as_ref().unwrap().attachments.len(), 1);
+        assert!(app.draft_dirty);
+        let epoch = app.privacy_epoch;
+        app.lock(&ctx);
+        let _ = rx.try_recv().unwrap();
+        app.event(
+            Event::AttachmentChosen {
+                path: Some(PathBuf::from("synthetic.bin")),
+                entry: id,
+                name: None,
+                epoch,
+            },
+            &ctx,
+        );
+        app.event(
+            Event::KeyFileChosen {
+                result: Ok(Some(PathBuf::from("stale.keyx"))),
+                target: KeyTarget::Unlock,
+                epoch,
+            },
+            &ctx,
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(app.key_file.is_none());
+        assert!(app.draft.is_none());
+    }
+    #[test]
+    fn completed_key_change_retains_unlock_method_when_lock_was_queued() {
+        let (mut app, _, ctx) = harness();
+        open(&mut app, &ctx);
+        app.key_editor = Some(KeyEditor::default());
+        app.pending_rekey = Some((false, Some(PathBuf::from("new-synthetic.keyx"))));
+        app.lock(&ctx);
+        assert!(app.key_editor.is_none());
+        app.event(
+            Event::Worker(Response::Rekeyed {
+                catalog: Catalog::default(),
+                warning: None,
+            }),
+            &ctx,
+        );
+        assert!(!app.use_password);
+        assert_eq!(app.key_file, Some(PathBuf::from("new-synthetic.keyx")));
+        assert!(app.locking);
+        assert!(app.screen == Screen::Unlock);
+        assert!(app.catalog.entries.is_empty());
     }
     #[test]
     fn dirty_navigation_waits_and_lock_clears_visible_owned_secrets() {
