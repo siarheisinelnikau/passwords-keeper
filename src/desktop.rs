@@ -118,6 +118,50 @@ impl Desktop {
                         let _ = proxy.send_event(Event::ExportChosen(path));
                     });
                 }
+                Effect::KeyFile {
+                    create,
+                    target,
+                    epoch,
+                } => {
+                    std::thread::spawn(move || {
+                        let dialog = rfd::FileDialog::new();
+                        let path = if create {
+                            dialog
+                                .add_filter("KeePass key file", &["keyx"])
+                                .set_file_name("Vault.keyx")
+                                .save_file()
+                        } else {
+                            dialog.pick_file()
+                        };
+                        let result = match path {
+                            Some(path) if create => {
+                                passwords_keeper::keyfile::generate(&path).map(|()| Some(path))
+                            }
+                            path => Ok(path),
+                        };
+                        let _ = proxy.send_event(Event::KeyFileChosen {
+                            result,
+                            target,
+                            epoch,
+                        });
+                    });
+                }
+                Effect::Attachment { entry, name, epoch } => {
+                    std::thread::spawn(move || {
+                        let dialog = rfd::FileDialog::new();
+                        let path = if let Some(name) = &name {
+                            dialog.set_file_name(name).save_file()
+                        } else {
+                            dialog.pick_file()
+                        };
+                        let _ = proxy.send_event(Event::AttachmentChosen {
+                            path,
+                            entry,
+                            name,
+                            epoch,
+                        });
+                    });
+                }
                 Effect::CheckUpdates(startup) => {
                     std::thread::spawn(move || {
                         let result = updates::check();

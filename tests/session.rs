@@ -11,7 +11,9 @@ fn session_lock_unlock_and_failed_seal_preserve_work() {
     let mut engine = Engine::default();
     let root = match engine.handle(Command::Open {
         path,
-        password: Zeroizing::new(PASSWORD.into()),
+        credentials: passwords_keeper::credentials::CredentialsInput::password(Zeroizing::new(
+            PASSWORD.into(),
+        )),
         create: true,
     }) {
         Response::Opened { catalog, .. } => catalog.groups[0].id,
@@ -26,10 +28,16 @@ fn session_lock_unlock_and_failed_seal_preserve_work() {
         Response::Locked { unsaved: true }
     ));
     assert!(matches!(
-        engine.handle(Command::Unlock(Zeroizing::new("wrong".into()))),
+        engine.handle(Command::Unlock(
+            passwords_keeper::credentials::CredentialsInput::password(Zeroizing::new(
+                "wrong".into()
+            ))
+        )),
         Response::Failed { .. }
     ));
-    match engine.handle(Command::Unlock(Zeroizing::new(PASSWORD.into()))) {
+    match engine.handle(Command::Unlock(
+        passwords_keeper::credentials::CredentialsInput::password(Zeroizing::new(PASSWORD.into())),
+    )) {
         Response::Opened {
             draft: Some(restored),
             ..
@@ -45,10 +53,16 @@ fn session_lock_unlock_and_failed_seal_preserve_work() {
         }
     ));
     assert!(matches!(
-        engine.handle(Command::Unlock(Zeroizing::new("wrong".into()))),
+        engine.handle(Command::Unlock(
+            passwords_keeper::credentials::CredentialsInput::password(Zeroizing::new(
+                "wrong".into()
+            ))
+        )),
         Response::Failed { .. }
     ));
-    match engine.handle(Command::Unlock(Zeroizing::new(PASSWORD.into()))) {
+    match engine.handle(Command::Unlock(
+        passwords_keeper::credentials::CredentialsInput::password(Zeroizing::new(PASSWORD.into())),
+    )) {
         Response::Opened {
             draft: Some(restored),
             ..

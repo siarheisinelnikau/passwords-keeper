@@ -19,6 +19,7 @@ fn draft(v: &Vault) -> EntryDraft {
         password: "SYNTHETIC SECRET only".into(),
         url: "https://example.invalid".into(),
         notes: "line one\nline two\nПример é".into(),
+        attachments: Vec::new(),
         ..Default::default()
     }
 }

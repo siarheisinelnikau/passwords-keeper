@@ -12,8 +12,8 @@ use xml::{name::OwnedName, reader::XmlEvent, EventReader};
 use crate::{
     crypt::ciphers::Cipher,
     db::{
-        Color, CustomData, CustomDataItem, CustomDataItemDenormalized, DeletedObject, DeletedObjects, Group,
-        Meta, Times, Value,
+        Color, CustomData, CustomDataItem, CustomDataItemDenormalized, DeletedObject,
+        DeletedObjects, Group, Meta, Times, Value,
     },
     error::XmlParseError,
     xml_db::get_epoch_baseline,
@@ -30,11 +30,15 @@ pub fn parse_xml_timestamp(t: &str) -> Result<chrono::NaiveDateTime, XmlParseErr
 
             // Cast the decoded base64 Vec into the array expected by i64::from_le_bytes
             let mut a: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
-            if v.len()!=8 { return Err(XmlParseError::Eof); }
+            if v.len() != 8 {
+                return Err(XmlParseError::Eof);
+            }
             a.copy_from_slice(&v);
             let seconds = i64::from_le_bytes(a);
             let duration = chrono::Duration::try_seconds(seconds).ok_or(XmlParseError::Eof)?;
-            let ndt = get_epoch_baseline().checked_add_signed(duration).ok_or(XmlParseError::Eof)?;
+            let ndt = get_epoch_baseline()
+                .checked_add_signed(duration)
+                .ok_or(XmlParseError::Eof)?;
             Ok(ndt)
         }
     }
@@ -69,7 +73,10 @@ pub(crate) fn bad_event(expected: &'static str, event: SimpleXmlEvent) -> XmlPar
     XmlParseError::BadEvent { expected, event }
 }
 
-pub(crate) fn parse(xml: &[u8], inner_cipher: &mut dyn Cipher) -> Result<KeePassXml, XmlParseError> {
+pub(crate) fn parse(
+    xml: &[u8],
+    inner_cipher: &mut dyn Cipher,
+) -> Result<KeePassXml, XmlParseError> {
     parse_from_bytes::<KeePassXml>(xml, inner_cipher)
 }
 
@@ -77,21 +84,40 @@ pub(crate) fn parse_from_bytes<P: FromXml>(
     xml: &[u8],
     inner_cipher: &mut dyn Cipher,
 ) -> Result<<P as FromXml>::Parses, XmlParseError> {
-    if xml.len()>32*1024*1024 { return Err(XmlParseError::ResourceLimit); }
-    if std::str::from_utf8(xml).is_err() || xml.windows(9).any(|v|v.eq_ignore_ascii_case(b"<!DOCTYPE")) {
+    if xml.len() > 32 * 1024 * 1024 {
+        return Err(XmlParseError::ResourceLimit);
+    }
+    if std::str::from_utf8(xml).is_err()
+        || xml.windows(9).any(|v| v.eq_ignore_ascii_case(b"<!DOCTYPE"))
+    {
         return Err(XmlParseError::Unsupported);
     }
-    let mut depth=0usize;
-    let mut items=0usize;
+    let mut depth = 0usize;
+    let mut legacy_binaries = 0usize;
+    let mut items = 0usize;
     for event in bounded_reader(xml) {
         match event? {
             XmlEvent::StartElement { name, .. } => {
-                depth+=1; items+=1;
-                if depth>128 || items>200_000 { return Err(XmlParseError::ResourceLimit); }
-                if name.local_name=="Binary" { return Err(XmlParseError::Unsupported); }
+                depth += 1;
+                items += 1;
+                if depth > 128 || items > 200_000 {
+                    return Err(XmlParseError::ResourceLimit);
+                }
+                if name.local_name == "Binaries" {
+                    legacy_binaries += 1;
+                } else if name.local_name == "Binary" && legacy_binaries > 0 {
+                    return Err(XmlParseError::Unsupported);
+                }
             }
-            XmlEvent::EndElement { .. } => { depth=depth.saturating_sub(1); }
-            XmlEvent::Characters(ref text) if text.len()>512*1024 => return Err(XmlParseError::ResourceLimit),
+            XmlEvent::EndElement { name } => {
+                if name.local_name == "Binaries" {
+                    legacy_binaries = legacy_binaries.saturating_sub(1);
+                }
+                depth = depth.saturating_sub(1);
+            }
+            XmlEvent::Characters(ref text) if text.len() > 512 * 1024 => {
+                return Err(XmlParseError::ResourceLimit)
+            }
             _ => {}
         }
     }
@@ -307,7 +333,8 @@ impl FromXml for Times {
                         out.expires = SimpleTag::<bool>::from_xml(iterator, inner_cipher)?.value;
                     }
                     "UsageCount" => {
-                        out.usage_count = SimpleTag::<usize>::from_xml(iterator, inner_cipher)?.value;
+                        out.usage_count =
+                            SimpleTag::<usize>::from_xml(iterator, inner_cipher)?.value;
                     }
 
                     _ => {
@@ -391,7 +418,12 @@ impl FromXml for DeletedObjects {
                     out.objects.push(object);
                 }
                 SimpleXmlEvent::End(name) if name == "DeletedObjects" => break,
-                _ => return Err(bad_event("start tag or close DeletedObjects", event.clone())),
+                _ => {
+                    return Err(bad_event(
+                        "start tag or close DeletedObjects",
+                        event.clone(),
+                    ))
+                }
             }
         }
 
@@ -423,7 +455,8 @@ impl FromXml for DeletedObject {
                         out.uuid = SimpleTag::<Uuid>::from_xml(iterator, inner_cipher)?.value;
                     }
                     "DeletionTime" => {
-                        out.deletion_time = SimpleTag::<NaiveDateTime>::from_xml(iterator, inner_cipher)?.value;
+                        out.deletion_time =
+                            SimpleTag::<NaiveDateTime>::from_xml(iterator, inner_cipher)?.value;
                     }
                     _ => return Err(bad_event("valid DeletedObject child", event.clone())),
                 },
@@ -462,7 +495,9 @@ impl FromXml for CustomData {
                             item.key.to_string(),
                             CustomDataItem {
                                 value: item.custom_data_item.value,
-                                last_modification_time: item.custom_data_item.last_modification_time,
+                                last_modification_time: item
+                                    .custom_data_item
+                                    .last_modification_time,
                             },
                         );
                     }
@@ -505,7 +540,8 @@ impl FromXml for CustomDataItemDenormalized {
                     }
                     "LastModificationTime" => {
                         out.custom_data_item.last_modification_time =
-                            SimpleTag::<Option<NaiveDateTime>>::from_xml(iterator, inner_cipher)?.value;
+                            SimpleTag::<Option<NaiveDateTime>>::from_xml(iterator, inner_cipher)?
+                                .value;
                     }
                     _ => return Err(bad_event("valid Item child", event.clone())),
                 },
@@ -564,14 +600,19 @@ mod parse_test {
         config::InnerCipherConfig,
         crypt::ciphers::PlainCipher,
         db::{
-            AutoType, AutoTypeAssociation, CustomData, CustomDataItemDenormalized, Entry, History, Times, Value,
+            AutoType, AutoTypeAssociation, CustomData, CustomDataItemDenormalized, Entry, History,
+            Times, Value,
         },
         xml_db::parse::{entry::StringField, DeletedObject, DeletedObjects, IgnoreSubfield, Root},
     };
 
-    use super::{entry::BinaryField, parse, parse_from_bytes, FromXml, KeePassXml, SimpleTag, XmlParseError};
+    use super::{
+        entry::BinaryField, parse, parse_from_bytes, FromXml, KeePassXml, SimpleTag, XmlParseError,
+    };
 
-    pub(crate) fn parse_test_xml<P: FromXml>(xml: &str) -> Result<<P as FromXml>::Parses, XmlParseError> {
+    pub(crate) fn parse_test_xml<P: FromXml>(
+        xml: &str,
+    ) -> Result<<P as FromXml>::Parses, XmlParseError> {
         parse_from_bytes::<P>(xml.as_bytes(), &mut PlainCipher)
     }
 
@@ -589,8 +630,9 @@ mod parse_test {
     #[test]
     fn test_simple_tag() -> Result<(), XmlParseError> {
         // String tag
-        let value =
-            parse_test_xml::<SimpleTag<String>>("<TestTag attribute=\"SomeValue\">Test-Value</TestTag>")?;
+        let value = parse_test_xml::<SimpleTag<String>>(
+            "<TestTag attribute=\"SomeValue\">Test-Value</TestTag>",
+        )?;
         assert_eq!(value.name, "TestTag");
         assert_eq!(value.value, "Test-Value");
 
@@ -600,7 +642,8 @@ mod parse_test {
         assert_eq!(value.name, "TestTag");
         assert_eq!(value.value, "Test-Valueeven more test data");
 
-        let value = parse_test_xml::<SimpleTag<String>>("<TestTag attribute=\"SomeValue\"></TestTag>");
+        let value =
+            parse_test_xml::<SimpleTag<String>>("<TestTag attribute=\"SomeValue\"></TestTag>");
         assert!(value.is_err());
 
         // Option<String> tag
@@ -610,22 +653,27 @@ mod parse_test {
         assert_eq!(value.name, "TestTag");
         assert_eq!(value.value, Some("Test-Value".to_string()));
 
-        let value = parse_test_xml::<SimpleTag<Option<String>>>("<TestTag attribute=\"SomeValue\"></TestTag>")?;
+        let value = parse_test_xml::<SimpleTag<Option<String>>>(
+            "<TestTag attribute=\"SomeValue\"></TestTag>",
+        )?;
         assert_eq!(value.name, "TestTag");
         assert_eq!(value.value, None);
 
         // bool tag
-        let value = parse_test_xml::<SimpleTag<bool>>("<TestTag attribute=\"SomeValue\">True</TestTag>")?;
+        let value =
+            parse_test_xml::<SimpleTag<bool>>("<TestTag attribute=\"SomeValue\">True</TestTag>")?;
         assert_eq!(value.name, "TestTag");
         assert!(value.value);
 
         // usize tag
-        let value = parse_test_xml::<SimpleTag<usize>>("<TestTag attribute=\"SomeValue\">42</TestTag>")?;
+        let value =
+            parse_test_xml::<SimpleTag<usize>>("<TestTag attribute=\"SomeValue\">42</TestTag>")?;
         assert_eq!(value.name, "TestTag");
         assert_eq!(value.value, 42);
 
         // isize tag
-        let value = parse_test_xml::<SimpleTag<isize>>("<TestTag attribute=\"SomeValue\">-42</TestTag>")?;
+        let value =
+            parse_test_xml::<SimpleTag<isize>>("<TestTag attribute=\"SomeValue\">-42</TestTag>")?;
         assert_eq!(value.name, "TestTag");
         assert_eq!(value.value, -42);
 
@@ -659,7 +707,8 @@ mod parse_test {
         let value = parse_test_xml::<KeePassXml>("<KeePassFile></TestTag>");
         assert!(matches!(value, Err(XmlParseError::BadEvent { .. })));
 
-        let value = parse_test_xml::<KeePassXml>("<KeePassFile>No-Characters-Allowed</KeePassFile>");
+        let value =
+            parse_test_xml::<KeePassXml>("<KeePassFile>No-Characters-Allowed</KeePassFile>");
         assert!(matches!(value, Err(XmlParseError::BadEvent { .. })));
 
         let value = parse_test_xml::<KeePassXml>("<KeePassFile><UnkownChildTag/></KeePassFile>");
@@ -710,10 +759,13 @@ mod parse_test {
         let value = parse_test_xml::<DeletedObjects>("<DeletedObjects></TestTag>");
         assert!(matches!(value, Err(XmlParseError::BadEvent { .. })));
 
-        let value = parse_test_xml::<DeletedObjects>("<DeletedObjects>No-Characters-Allowed</DeletedObjects>");
+        let value = parse_test_xml::<DeletedObjects>(
+            "<DeletedObjects>No-Characters-Allowed</DeletedObjects>",
+        );
         assert!(matches!(value, Err(XmlParseError::BadEvent { .. })));
 
-        let value = parse_test_xml::<DeletedObjects>("<DeletedObjects><UnkownChildTag/></DeletedObjects>");
+        let value =
+            parse_test_xml::<DeletedObjects>("<DeletedObjects><UnkownChildTag/></DeletedObjects>");
         assert!(matches!(value, Err(XmlParseError::BadEvent { .. })));
 
         Ok(())
@@ -727,10 +779,12 @@ mod parse_test {
         let value = parse_test_xml::<DeletedObject>("<DeletedObject></TestTag>");
         assert!(matches!(value, Err(XmlParseError::BadEvent { .. })));
 
-        let value = parse_test_xml::<DeletedObject>("<DeletedObject>No-Characters-Allowed</DeletedObject>");
+        let value =
+            parse_test_xml::<DeletedObject>("<DeletedObject>No-Characters-Allowed</DeletedObject>");
         assert!(matches!(value, Err(XmlParseError::BadEvent { .. })));
 
-        let value = parse_test_xml::<DeletedObject>("<DeletedObject><UnkownChildTag/></DeletedObject>");
+        let value =
+            parse_test_xml::<DeletedObject>("<DeletedObject><UnkownChildTag/></DeletedObject>");
         assert!(matches!(value, Err(XmlParseError::BadEvent { .. })));
 
         Ok(())
@@ -761,7 +815,8 @@ mod parse_test {
         let value = parse_test_xml::<CustomDataItemDenormalized>("<Item></TestTag>");
         assert!(matches!(value, Err(XmlParseError::BadEvent { .. })));
 
-        let value = parse_test_xml::<CustomDataItemDenormalized>("<Item>No-Characters-Allowed</Item>");
+        let value =
+            parse_test_xml::<CustomDataItemDenormalized>("<Item>No-Characters-Allowed</Item>");
         assert!(matches!(value, Err(XmlParseError::BadEvent { .. })));
 
         let value = parse_test_xml::<CustomDataItemDenormalized>("<Item><UnkownChildTag/></Item>");
@@ -778,7 +833,9 @@ mod parse_test {
     #[test]
     fn test_ignore_subfield() -> Result<(), XmlParseError> {
         parse_test_xml::<IgnoreSubfield>("<TestTag>SomeData</TestTag>")?;
-        parse_test_xml::<IgnoreSubfield>("<TestTag>SomeData<More-Content></More-Content></TestTag>")?;
+        parse_test_xml::<IgnoreSubfield>(
+            "<TestTag>SomeData<More-Content></More-Content></TestTag>",
+        )?;
 
         let value = parse_test_xml::<IgnoreSubfield>("<Item></TestTag>");
         assert!(matches!(value, Err(XmlParseError::Xml(_))));
@@ -794,7 +851,9 @@ mod parse_test {
 
     #[test]
     fn test_binary_field() -> Result<(), XmlParseError> {
-        let value = parse_test_xml::<BinaryField>("<Binary><Key>MyField</Key><Value Ref=\"asdf\"/></Binary>")?;
+        let value = parse_test_xml::<BinaryField>(
+            "<Binary><Key>MyField</Key><Value Ref=\"asdf\"/></Binary>",
+        )?;
 
         assert_eq!(value.key, "MyField");
         assert_eq!(value.identifier, "asdf");
@@ -808,12 +867,14 @@ mod parse_test {
         let value = parse_test_xml::<BinaryField>("<Binary></Binary>");
         assert!(matches!(value, Err(XmlParseError::BadEvent { .. })));
 
-        let value =
-            parse_test_xml::<BinaryField>("<Binary><WrongTag/><Key>asdf</Key><Value Ref=\"asdf\"/></Binary>");
+        let value = parse_test_xml::<BinaryField>(
+            "<Binary><WrongTag/><Key>asdf</Key><Value Ref=\"asdf\"/></Binary>",
+        );
         assert!(matches!(value, Err(XmlParseError::BadEvent { .. })));
 
-        let value =
-            parse_test_xml::<BinaryField>("<Binary><Key>asdf</Key><WrongTag/><Value Ref=\"asdf\"/></Binary>");
+        let value = parse_test_xml::<BinaryField>(
+            "<Binary><Key>asdf</Key><WrongTag/><Value Ref=\"asdf\"/></Binary>",
+        );
         assert!(matches!(value, Err(XmlParseError::BadEvent { .. })));
 
         let value = parse_test_xml::<BinaryField>(
@@ -821,7 +882,8 @@ mod parse_test {
         );
         assert!(matches!(value, Err(XmlParseError::BadEvent { .. })));
 
-        let value = parse_test_xml::<BinaryField>("<Binary><Key></Key><Value Ref=\"asdf\"/></Binary>");
+        let value =
+            parse_test_xml::<BinaryField>("<Binary><Key></Key><Value Ref=\"asdf\"/></Binary>");
         assert!(matches!(value, Err(XmlParseError::BadEvent { .. })));
 
         let value = parse_test_xml::<BinaryField>("<Binary><Key>mykey</Key><Value/></Binary>");
@@ -903,7 +965,8 @@ mod parse_test {
         let value = parse_test_xml::<AutoType>("Not a tag");
         assert!(matches!(value, Err(XmlParseError::BadEvent { .. })));
 
-        let value = parse_test_xml::<AutoType>("<AutoType><StrangeTag>Data</StrangeTag></AutoType>");
+        let value =
+            parse_test_xml::<AutoType>("<AutoType><StrangeTag>Data</StrangeTag></AutoType>");
         assert!(value.is_ok());
 
         Ok(())
@@ -929,8 +992,9 @@ mod parse_test {
         let value = parse_test_xml::<AutoTypeAssociation>("Not a tag");
         assert!(matches!(value, Err(XmlParseError::BadEvent { .. })));
 
-        let value =
-            parse_test_xml::<AutoTypeAssociation>("<Association><StrangeTag>Data</StrangeTag></Association>");
+        let value = parse_test_xml::<AutoTypeAssociation>(
+            "<Association><StrangeTag>Data</StrangeTag></Association>",
+        );
         assert!(value.is_ok());
 
         Ok(())
@@ -957,9 +1021,14 @@ mod parse_test {
     }
 }
 
-fn bounded_reader(xml:&[u8])->EventReader<&[u8]> {
-    xml::reader::ParserConfig2::new().max_attributes(64).max_name_length(256)
-        .max_attribute_length(4096).max_data_length(512*1024)
-        .max_entity_expansion_depth(1).max_entity_expansion_length(512*1024)
-        .allow_multiple_root_elements(false).create_reader(xml)
+fn bounded_reader(xml: &[u8]) -> EventReader<&[u8]> {
+    xml::reader::ParserConfig2::new()
+        .max_attributes(64)
+        .max_name_length(256)
+        .max_attribute_length(4096)
+        .max_data_length(512 * 1024)
+        .max_entity_expansion_depth(1)
+        .max_entity_expansion_length(512 * 1024)
+        .allow_multiple_root_elements(false)
+        .create_reader(xml)
 }

@@ -124,24 +124,29 @@ impl ChallengeResponseKey {
                 let secret_bytes = hex::decode(secret)
                     .map_err(|e| DatabaseKeyError::ChallengeResponseKeyError(e.to_string()))?;
 
-                let response = crate::crypt::calculate_hmac_sha1(&[challenge], &secret_bytes)?.to_vec();
+                let response =
+                    crate::crypt::calculate_hmac_sha1(&[challenge], &secret_bytes)?.to_vec();
                 Ok(response)
             }
             ChallengeResponseKey::YubikeyChallenge(yubikey, slot_number) => {
                 let mut challenge_response_client = ChallengeResponse::new().map_err(|e| {
-                    DatabaseKeyError::ChallengeResponseKeyError(format!("Could not search for yubikey: {}", e))
+                    DatabaseKeyError::ChallengeResponseKeyError(format!(
+                        "Could not search for yubikey: {}",
+                        e
+                    ))
                 })?;
                 let slot = parse_yubikey_slot(slot_number)?;
 
-                let yubikey_device =
-                    match challenge_response_client.find_device_from_serial(yubikey.serial_number) {
-                        Ok(d) => d,
-                        Err(_e) => {
-                            return Err(DatabaseKeyError::ChallengeResponseKeyError(
-                                "Yubikey not found".to_string(),
-                            ))
-                        }
-                    };
+                let yubikey_device = match challenge_response_client
+                    .find_device_from_serial(yubikey.serial_number)
+                {
+                    Ok(d) => d,
+                    Err(_e) => {
+                        return Err(DatabaseKeyError::ChallengeResponseKeyError(
+                            "Yubikey not found".to_string(),
+                        ))
+                    }
+                };
 
                 let mut config = Config::new_from(yubikey_device);
                 config = config.set_variable_size(true);
@@ -161,7 +166,10 @@ impl ChallengeResponseKey {
 
     pub fn get_available_yubikeys() -> Result<Vec<Yubikey>, DatabaseKeyError> {
         let mut challenge_response_client = ChallengeResponse::new().map_err(|e| {
-            DatabaseKeyError::ChallengeResponseKeyError(format!("Could not search for yubikey: {}", e))
+            DatabaseKeyError::ChallengeResponseKeyError(format!(
+                "Could not search for yubikey: {}",
+                e
+            ))
         })?;
         let mut response: Vec<Yubikey> = vec![];
         let yubikeys = match challenge_response_client.find_all_devices() {
@@ -224,6 +232,7 @@ impl ChallengeResponseKey {
 pub struct DatabaseKey {
     password: Option<String>,
     keyfile: Option<Vec<u8>>,
+    keyfile_component: Option<[u8; 32]>,
     #[cfg(feature = "challenge_response")]
     challenge_response_key: Option<ChallengeResponseKey>,
     #[cfg(feature = "challenge_response")]
@@ -231,22 +240,34 @@ pub struct DatabaseKey {
 }
 
 impl DatabaseKey {
+    /// Accept a normalized 256-bit key-file component without re-reading its file.
+    pub fn with_keyfile_component(mut self, component: &[u8; 32]) -> Self {
+        self.keyfile_component = Some(*component);
+        self.keyfile = None;
+        self
+    }
     pub fn with_password(mut self, password: &str) -> Self {
         self.password = Some(password.to_string());
         self
     }
 
     #[cfg(feature = "utilities")]
-    pub fn with_password_from_prompt(mut self, prompt_message: &str) -> Result<Self, std::io::Error> {
+    pub fn with_password_from_prompt(
+        mut self,
+        prompt_message: &str,
+    ) -> Result<Self, std::io::Error> {
         self.password = Some(rpassword::prompt_password(prompt_message)?);
         Ok(self)
     }
 
     #[cfg(all(feature = "challenge_response", feature = "utilities"))]
-    pub fn with_hmac_sha1_secret_from_prompt(mut self, prompt_message: &str) -> Result<Self, std::io::Error> {
-        self.challenge_response_key = Some(ChallengeResponseKey::LocalChallenge(rpassword::prompt_password(
-            prompt_message,
-        )?));
+    pub fn with_hmac_sha1_secret_from_prompt(
+        mut self,
+        prompt_message: &str,
+    ) -> Result<Self, std::io::Error> {
+        self.challenge_response_key = Some(ChallengeResponseKey::LocalChallenge(
+            rpassword::prompt_password(prompt_message)?,
+        ));
         Ok(self)
     }
 
@@ -255,12 +276,16 @@ impl DatabaseKey {
         keyfile.read_to_end(&mut buf)?;
 
         self.keyfile = Some(buf);
+        self.keyfile_component = None;
 
         Ok(self)
     }
 
     #[cfg(feature = "challenge_response")]
-    pub fn with_challenge_response_key(mut self, challenge_response_key: ChallengeResponseKey) -> Self {
+    pub fn with_challenge_response_key(
+        mut self,
+        challenge_response_key: ChallengeResponseKey,
+    ) -> Self {
         self.challenge_response_key = Some(challenge_response_key);
         self
     }
@@ -286,7 +311,9 @@ impl DatabaseKey {
             out.push(calculate_sha256(&[p.as_bytes()])?.to_vec());
         }
 
-        if let Some(ref f) = self.keyfile {
+        if let Some(component) = &self.keyfile_component {
+            out.push(component.to_vec());
+        } else if let Some(ref f) = self.keyfile {
             out.push(parse_keyfile(f)?);
         }
 
@@ -308,7 +335,7 @@ impl DatabaseKey {
 
     /// Returns true if the database key is not associated with any key component.
     pub fn is_empty(&self) -> bool {
-        if self.password.is_some() || self.keyfile.is_some() {
+        if self.password.is_some() || self.keyfile.is_some() || self.keyfile_component.is_some() {
             return false;
         }
         #[cfg(feature = "challenge_response")]
@@ -328,7 +355,9 @@ mod key_tests {
 
     #[test]
     fn test_key() -> Result<(), DatabaseKeyError> {
-        let ke = DatabaseKey::new().with_password("asdf").get_key_elements()?;
+        let ke = DatabaseKey::new()
+            .with_password("asdf")
+            .get_key_elements()?;
         assert_eq!(ke.len(), 1);
 
         let ke = DatabaseKey::new()
@@ -349,7 +378,8 @@ mod key_tests {
 
         let ke = DatabaseKey::new()
             .with_keyfile(
-                &mut "<KeyFile><Key><Data>0!23456789ABCDEF0123456789ABCDEF</Data></Key></KeyFile>".as_bytes(),
+                &mut "<KeyFile><Key><Data>0!23456789ABCDEF0123456789ABCDEF</Data></Key></KeyFile>"
+                    .as_bytes(),
             )?
             .get_key_elements()?;
         assert_eq!(ke.len(), 1);
@@ -404,5 +434,7 @@ mod key_tests {
 }
 
 impl std::fmt::Debug for DatabaseKey {
- fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result { f.write_str("DatabaseKey([REDACTED])") }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DatabaseKey([REDACTED])")
+    }
 }

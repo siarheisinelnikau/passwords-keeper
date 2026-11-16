@@ -67,7 +67,10 @@ pub struct Database {
 
 impl Database {
     /// Parse a database from a std::io::Read
-    pub fn open(source: &mut dyn std::io::Read, key: DatabaseKey) -> Result<Database, DatabaseOpenError> {
+    pub fn open(
+        source: &mut dyn std::io::Read,
+        key: DatabaseKey,
+    ) -> Result<Database, DatabaseOpenError> {
         let mut data = Vec::new();
         source.read_to_end(&mut data)?;
 
@@ -104,7 +107,10 @@ impl Database {
     }
 
     /// Helper function to load a database into its internal XML chunks
-    pub fn get_xml(source: &mut dyn std::io::Read, key: DatabaseKey) -> Result<Vec<u8>, DatabaseOpenError> {
+    pub fn get_xml(
+        source: &mut dyn std::io::Read,
+        key: DatabaseKey,
+    ) -> Result<Vec<u8>, DatabaseOpenError> {
         let mut data = Vec::new();
         source.read_to_end(&mut data)?;
 
@@ -121,7 +127,9 @@ impl Database {
     }
 
     /// Get the version of a database without decrypting it
-    pub fn get_version(source: &mut dyn std::io::Read) -> Result<DatabaseVersion, DatabaseIntegrityError> {
+    pub fn get_version(
+        source: &mut dyn std::io::Read,
+    ) -> Result<DatabaseVersion, DatabaseIntegrityError> {
         let mut data = vec![0; DatabaseVersion::get_version_header_size()];
         source.read_exact(&mut data)?;
         DatabaseVersion::parse(data.as_ref())
@@ -152,15 +160,16 @@ impl Database {
     #[cfg(feature = "_merge")]
     fn merge_deletions(&mut self, other: &Database) -> Result<MergeLog, MergeError> {
         // Utility function to search for a UUID in the VecDeque of deleted objects.
-        let is_in_deleted_queue = |uuid: Uuid, deleted_groups_queue: &VecDeque<DeletedObject>| -> bool {
-            for deleted_object in deleted_groups_queue {
-                // This group still has a child group, but it is not going to be deleted.
-                if deleted_object.uuid == uuid {
-                    return true;
+        let is_in_deleted_queue =
+            |uuid: Uuid, deleted_groups_queue: &VecDeque<DeletedObject>| -> bool {
+                for deleted_object in deleted_groups_queue {
+                    // This group still has a child group, but it is not going to be deleted.
+                    if deleted_object.uuid == uuid {
+                        return true;
+                    }
                 }
-            }
-            false
-        };
+                false
+            };
 
         let mut log = MergeLog::default();
 
@@ -343,31 +352,39 @@ impl Database {
 
                 // The entry already exists but is not at the right location. We might have to
                 // relocate it.
-                let mut existing_entry = self.root.find_entry(&existing_entry_location).unwrap().clone();
+                let mut existing_entry = self
+                    .root
+                    .find_entry(&existing_entry_location)
+                    .unwrap()
+                    .clone();
 
                 // The entry already exists but is not at the right location. We might have to
                 // relocate it.
-                if current_group_path.last() != destination_entry_location.last() && !is_in_deleted_group {
-                    let source_location_changed_time = match other_entry.times.get_location_changed() {
-                        Some(t) => *t,
-                        None => {
-                            log.warnings.push(format!(
-                                "Entry {} did not have a location updated timestamp",
-                                other_entry.uuid
-                            ));
-                            Times::epoch()
-                        }
-                    };
-                    let destination_location_changed = match existing_entry.times.get_location_changed() {
-                        Some(t) => *t,
-                        None => {
-                            log.warnings.push(format!(
-                                "Entry {} did not have a location updated timestamp",
-                                other_entry.uuid
-                            ));
-                            Times::now()
-                        }
-                    };
+                if current_group_path.last() != destination_entry_location.last()
+                    && !is_in_deleted_group
+                {
+                    let source_location_changed_time =
+                        match other_entry.times.get_location_changed() {
+                            Some(t) => *t,
+                            None => {
+                                log.warnings.push(format!(
+                                    "Entry {} did not have a location updated timestamp",
+                                    other_entry.uuid
+                                ));
+                                Times::epoch()
+                            }
+                        };
+                    let destination_location_changed =
+                        match existing_entry.times.get_location_changed() {
+                            Some(t) => *t,
+                            None => {
+                                log.warnings.push(format!(
+                                    "Entry {} did not have a location updated timestamp",
+                                    other_entry.uuid
+                                ));
+                                Times::now()
+                            }
+                        };
                     if source_location_changed_time > destination_location_changed {
                         log.events.push(MergeEvent {
                             event_type: MergeEventType::EntryLocationUpdated,
@@ -466,26 +483,28 @@ impl Database {
                     // The group already exists but is not at the right location. We might have to
                     // relocate it.
                     let existing_group = self.root.find_group(&existing_group_location).unwrap();
-                    let existing_group_location_changed = match existing_group.times.get_location_changed() {
-                        Some(t) => *t,
-                        None => {
-                            log.warnings.push(format!(
-                                "Entry {} did not have a location changed timestamp",
-                                existing_group.uuid
-                            ));
-                            Times::now()
-                        }
-                    };
-                    let other_group_location_changed = match other_group.times.get_location_changed() {
-                        Some(t) => *t,
-                        None => {
-                            log.warnings.push(format!(
-                                "Entry {} did not have a location changed timestamp",
-                                other_group.uuid
-                            ));
-                            Times::epoch()
-                        }
-                    };
+                    let existing_group_location_changed =
+                        match existing_group.times.get_location_changed() {
+                            Some(t) => *t,
+                            None => {
+                                log.warnings.push(format!(
+                                    "Entry {} did not have a location changed timestamp",
+                                    existing_group.uuid
+                                ));
+                                Times::now()
+                            }
+                        };
+                    let other_group_location_changed =
+                        match other_group.times.get_location_changed() {
+                            Some(t) => *t,
+                            None => {
+                                log.warnings.push(format!(
+                                    "Entry {} did not have a location changed timestamp",
+                                    other_group.uuid
+                                ));
+                                Times::epoch()
+                            }
+                        };
                     // The other group was moved after the current group, so we have to relocate it.
                     if existing_group_location_changed < other_group_location_changed {
                         self.relocate_node(
@@ -509,7 +528,8 @@ impl Database {
 
                 // The group already exists and is at the right location, so we can proceed and merge
                 // the two groups.
-                let new_merge_log = self.merge_group(new_group_location, other_group, is_in_deleted_group)?;
+                let new_merge_log =
+                    self.merge_group(new_group_location, other_group, is_in_deleted_group)?;
                 log.append(&new_merge_log);
                 continue;
             }
@@ -527,7 +547,8 @@ impl Database {
             };
             new_group_parent_group.add_child(new_group.clone());
 
-            let new_merge_log = self.merge_group(new_group_location, other_group, is_in_deleted_group)?;
+            let new_merge_log =
+                self.merge_group(new_group_location, other_group, is_in_deleted_group)?;
             log.append(&new_merge_log);
         }
 
@@ -620,7 +641,8 @@ impl Times {
     }
 
     pub fn set_last_access(&mut self, time: NaiveDateTime) {
-        self.times.insert(LAST_ACCESS_TIME_TAG_NAME.to_string(), time);
+        self.times
+            .insert(LAST_ACCESS_TIME_TAG_NAME.to_string(), time);
     }
 
     pub fn get_location_changed(&self) -> Option<&NaiveDateTime> {
@@ -628,14 +650,17 @@ impl Times {
     }
 
     pub fn set_location_changed(&mut self, time: NaiveDateTime) {
-        self.times.insert(LOCATION_CHANGED_TAG_NAME.to_string(), time);
+        self.times
+            .insert(LOCATION_CHANGED_TAG_NAME.to_string(), time);
     }
 
     // Returns the current time, without the nanoseconds since
     // the last leap second.
     pub fn now() -> NaiveDateTime {
         let now = chrono::Utc::now().timestamp();
-        chrono::DateTime::from_timestamp(now, 0).unwrap().naive_utc()
+        chrono::DateTime::from_timestamp(now, 0)
+            .unwrap()
+            .naive_utc()
     }
 
     pub fn epoch() -> NaiveDateTime {
@@ -684,6 +709,12 @@ pub struct CustomDataItemDenormalized {
 pub struct HeaderAttachment {
     pub flags: u8,
     pub content: Vec<u8>,
+}
+impl Drop for HeaderAttachment {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.content.zeroize();
+    }
 }
 
 /// Elements that have been previously deleted
@@ -738,8 +769,8 @@ impl FromStr for Color {
             return Err(ParseColorError(s.to_string()));
         }
 
-        let v =
-            u64::from_str_radix(s.trim_start_matches('#'), 16).map_err(|_e| ParseColorError(s.to_string()))?;
+        let v = u64::from_str_radix(s.trim_start_matches('#'), 16)
+            .map_err(|_e| ParseColorError(s.to_string()))?;
 
         let r = ((v >> 16) & 0xff) as u8;
         let g = ((v >> 8) & 0xff) as u8;

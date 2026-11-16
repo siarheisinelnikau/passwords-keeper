@@ -4,6 +4,10 @@ use thiserror::Error;
 pub enum VaultError {
     #[error("The master password is incorrect, or the authenticated file was modified.")]
     Credentials,
+    #[error("Choose a master password, a key file, or both.")]
+    CredentialsRequired,
+    #[error("The key file is invalid, damaged, unsupported, or exceeds 1 MiB.")]
+    KeyFile,
     #[error("The vault is damaged or incomplete. The original file has not been changed.")]
     Corrupt,
     #[error("This KDBX feature is not supported by this version.")]
@@ -24,6 +28,8 @@ pub enum VaultError {
     NotFound,
     #[error("A title and a valid destination group are required.")]
     InvalidEntry,
+    #[error("An attachment with this name already exists. Remove it first or rename the file.")]
+    AttachmentExists,
     #[error("Operating system randomness is unavailable.")]
     Random,
     #[error("The clipboard is unavailable. Try copying again.")]
