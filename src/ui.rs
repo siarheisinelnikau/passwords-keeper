@@ -301,7 +301,9 @@ impl App {
             .min()
     }
     pub fn timers(&mut self, ctx: &egui::Context) -> bool {
-        let now = Instant::now();
+        self.timers_at(ctx, Instant::now())
+    }
+    fn timers_at(&mut self, ctx: &egui::Context, now: Instant) -> bool {
         let mut changed = false;
         if self.screen == Screen::Workspace
             && now.duration_since(self.last_activity)
@@ -2149,8 +2151,15 @@ mod tests {
     fn idle_and_reveal_deadlines_are_finite_without_rendering() {
         let (mut app, _, ctx) = harness();
         open(&mut app, &ctx);
-        app.last_activity = Instant::now() - Duration::from_secs(3601);
-        assert!(app.timers(&ctx));
+        let start = app.last_activity;
+        app.reveal = true;
+        app.reveal_until = Some(start + Duration::from_secs(15));
+        assert_eq!(app.deadline(), app.reveal_until);
+        assert!(app.timers_at(&ctx, start + Duration::from_secs(16)));
+        assert!(!app.reveal);
+        assert!(app.reveal_until.is_none());
+        assert!(app.screen == Screen::Workspace);
+        assert!(app.timers_at(&ctx, start + Duration::from_secs(3601)));
         assert!(app.screen == Screen::Unlock);
         assert!(app.deadline().is_none());
     }
